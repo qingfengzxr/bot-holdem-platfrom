@@ -1,0 +1,6 @@
+target/
+.DS_Store
+.mise.local.toml
+.env
+.env.*
+!.env.example

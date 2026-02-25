@@ -1,0 +1,39 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["cooper"]
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1.89"
+axum = "0.8.4"
+bytes = "1.10.1"
+chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
+ed25519-dalek = "2.1.1"
+futures = "0.3.31"
+hex = "0.4.3"
+jsonrpsee = { version = "0.24.7", features = ["server", "macros"] }
+rand = "0.8.5"
+rs_poker = { package = "rs_poker", version = "4.1.0", features = ["arena", "serde"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.0", features = ["serde", "v4", "v7"] }
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "warn"
+nursery = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "warn"

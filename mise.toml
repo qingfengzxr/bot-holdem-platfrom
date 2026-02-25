@@ -1,0 +1,33 @@
+[tools]
+rust = "1.88"
+
+[tasks."check"]
+description = "Run format, clippy, and tests"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo test --workspace",
+]
+
+[tasks."check:fmt"]
+description = "Format check"
+run = "cargo fmt --all --check"
+
+[tasks."check:clippy"]
+description = "Lint check"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks."check:test"]
+description = "Run tests"
+run = "cargo test --workspace"
+
+[tasks."fix"]
+description = "Format and lint fixes"
+run = [
+  "cargo fmt --all",
+  "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings",
+]
+
+[tasks."dev:app"]
+description = "Run app server"
+run = "cargo run -p app-server"

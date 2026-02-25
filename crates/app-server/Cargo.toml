@@ -1,0 +1,18 @@
+[package]
+name = "app-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+observability = { path = "../observability" }
+poker-domain = { path = "../poker-domain" }
+poker-engine = { path = "../poker-engine" }
+rpc-gateway = { path = "../rpc-gateway" }
+table-service = { path = "../table-service" }
+tokio.workspace = true
+tracing.workspace = true

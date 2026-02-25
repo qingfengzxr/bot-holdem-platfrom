@@ -1,0 +1,14 @@
+[package]
+name = "seat-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+poker-domain = { path = "../poker-domain" }
+serde.workspace = true
+thiserror.workspace = true

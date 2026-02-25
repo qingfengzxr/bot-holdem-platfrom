@@ -1,0 +1,13 @@
+[package]
+name = "poker-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+poker-domain = { path = "../poker-domain" }
+rs_poker.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "table-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+poker-domain = { path = "../poker-domain" }
+poker-engine = { path = "../poker-engine" }
+tokio.workspace = true
+tracing.workspace = true
