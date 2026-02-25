@@ -63,6 +63,20 @@ pub struct SigningMessageInput<'a> {
     pub meta: &'a SignedRequestMeta,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatKeyBindingClaim {
+    pub agent_id: Option<AgentId>,
+    pub session_id: Option<SessionId>,
+    pub room_id: RoomId,
+    pub seat_id: u8,
+    pub seat_address: String,
+    pub card_encrypt_pubkey: String,
+    pub request_verify_pubkey: String,
+    pub key_algo: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 pub trait ReplayNonceStore: Send + Sync {
     fn consume_once(&self, key: ReplayNonceKey) -> Result<(), AuthError>;
 }
@@ -167,6 +181,39 @@ pub fn verify_ed25519_signature(
         .map_err(|_| AuthError::SignatureVerificationFailed)
 }
 
+pub fn build_seat_key_binding_message(claim: &SeatKeyBindingClaim) -> String {
+    format!(
+        "room_id={}|seat_id={}|seat_address={}|card_encrypt_pubkey={}|request_verify_pubkey={}|key_algo={}|issued_at={}|expires_at={}|agent_id={}|session_id={}",
+        claim.room_id.0,
+        claim.seat_id,
+        claim.seat_address,
+        claim.card_encrypt_pubkey,
+        claim.request_verify_pubkey,
+        claim.key_algo,
+        claim.issued_at.to_rfc3339(),
+        claim
+            .expires_at
+            .map_or_else(String::new, |v| v.to_rfc3339()),
+        claim.agent_id.map_or_else(String::new, |v| v.0.to_string()),
+        claim
+            .session_id
+            .map_or_else(String::new, |v| v.0.to_string()),
+    )
+}
+
+pub fn verify_seat_key_binding_proof_ed25519(
+    claim: &SeatKeyBindingClaim,
+    proof_signature_hex: &str,
+    proof_pubkey_hex: &str,
+) -> Result<(), AuthError> {
+    let message = build_seat_key_binding_message(claim);
+    let material = SignatureMaterial {
+        pubkey_hex: proof_pubkey_hex,
+        signature_hex: proof_signature_hex,
+    };
+    verify_ed25519_signature(&material, message.as_bytes())
+}
+
 pub fn consume_replay_nonce<S: ReplayNonceStore>(
     store: &S,
     agent_id: AgentId,
@@ -220,5 +267,25 @@ mod tests {
         let now = Utc::now();
         let result = validate_request_window(now, now - Duration::seconds(30), 1_000, 5_000);
         assert!(matches!(result, Err(AuthError::RequestExpired)));
+    }
+
+    #[test]
+    fn seat_key_binding_message_is_stable() {
+        let claim = SeatKeyBindingClaim {
+            agent_id: None,
+            session_id: None,
+            room_id: RoomId::new(),
+            seat_id: 1,
+            seat_address: "cfx:abc".to_string(),
+            card_encrypt_pubkey: "encpk".to_string(),
+            request_verify_pubkey: "sigpk".to_string(),
+            key_algo: "x25519+ed25519".to_string(),
+            issued_at: Utc::now(),
+            expires_at: None,
+        };
+
+        let msg = build_seat_key_binding_message(&claim);
+        assert!(msg.contains("seat_address=cfx:abc"));
+        assert!(msg.contains("key_algo=x25519+ed25519"));
     }
 }

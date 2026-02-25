@@ -10,3 +10,4 @@ workspace = true
 [dependencies]
 axum.workspace = true
 serde.workspace = true
+tracing.workspace = true

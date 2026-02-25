@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use poker_domain::{ActionType, HandId, RequestId, RoomId, SeatId, SessionId};
 use rpc_gateway::{GameActRequest, GameGetStateRequest, RoomBindAddressRequest};
-use seat_crypto::HoleCardsDealtCipherPayload;
+use seat_crypto::{HoleCardsDealtCipherPayload, SeatCryptoError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -18,6 +18,10 @@ pub enum AgentSkillError {
     MissingSeatContext,
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("seat crypto error: {0}")]
+    SeatCrypto(#[from] SeatCryptoError),
+    #[error("action not in legal action set")]
+    ActionNotLegal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +107,39 @@ impl LocalAgentSkill {
             hand_id,
             seat_id: Some(seat_ctx.seat_id),
         })
+    }
+
+    pub fn decrypt_private_payloads_placeholder(
+        &self,
+        payloads: &[HoleCardsDealtCipherPayload],
+    ) -> Result<Vec<Vec<u8>>, AgentSkillError> {
+        let seat_ctx = self
+            .seat_ctx
+            .as_ref()
+            .ok_or(AgentSkillError::MissingSeatContext)?;
+
+        payloads
+            .iter()
+            .filter(|p| p.aad.room_id == seat_ctx.room_id && p.aad.seat_id == seat_ctx.seat_id)
+            .map(|p| {
+                p.envelope
+                    .decode_ciphertext()
+                    .map_err(AgentSkillError::from)
+            })
+            .collect()
+    }
+
+    pub fn validate_action_choice(
+        &self,
+        legal_actions: &[String],
+        action_type: ActionType,
+    ) -> Result<(), AgentSkillError> {
+        let normalized = format!("{action_type:?}").to_lowercase();
+        if legal_actions.iter().any(|a| a == &normalized) {
+            Ok(())
+        } else {
+            Err(AgentSkillError::ActionNotLegal)
+        }
     }
 }
 

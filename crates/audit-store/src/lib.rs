@@ -54,6 +54,19 @@ pub struct BehaviorEventRecord {
     pub trace_id: TraceId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxEventRecord {
+    pub outbox_event_id: String,
+    pub topic: String,
+    pub partition_key: String,
+    pub payload_json: Value,
+    pub status: String,
+    pub attempts: u32,
+    pub available_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[async_trait]
 pub trait AuditRepository: Send + Sync {
     async fn insert_action_attempt(
@@ -67,6 +80,13 @@ pub trait AuditRepository: Send + Sync {
     ) -> Result<(), AuditStoreError>;
 
     async fn append_hand_events(&self, events: &[HandEvent]) -> Result<(), AuditStoreError>;
+
+    async fn insert_outbox_event(&self, record: &OutboxEventRecord) -> Result<(), AuditStoreError>;
+
+    async fn fetch_pending_outbox_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OutboxEventRecord>, AuditStoreError>;
 }
 
 #[derive(Debug, Default)]
@@ -90,5 +110,19 @@ impl AuditRepository for NoopAuditRepository {
 
     async fn append_hand_events(&self, _events: &[HandEvent]) -> Result<(), AuditStoreError> {
         Ok(())
+    }
+
+    async fn insert_outbox_event(
+        &self,
+        _record: &OutboxEventRecord,
+    ) -> Result<(), AuditStoreError> {
+        Ok(())
+    }
+
+    async fn fetch_pending_outbox_events(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<OutboxEventRecord>, AuditStoreError> {
+        Ok(Vec::new())
     }
 }

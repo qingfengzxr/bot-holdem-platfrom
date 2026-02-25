@@ -8,8 +8,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-agent-skill = { path = "../agent-skill" }
+agent-sdk = { path = "../agent-sdk" }
 anyhow.workspace = true
 observability = { path = "../observability" }
+poker-domain = { path = "../poker-domain" }
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

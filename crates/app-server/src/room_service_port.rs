@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use rpc_gateway::{
     GameActRequest, GameGetStateRequest, RoomBindAddressRequest, RoomBindSessionKeysRequest,
-    RoomServicePort, RpcGatewayError, to_player_action,
+    RoomListRequest, RoomReadyRequest, RoomServicePort, RoomSummary, RpcGatewayError,
+    to_player_action,
 };
 use table_service::{RoomHandle, spawn_room_actor};
 
@@ -48,6 +49,32 @@ impl AppRoomService {
 
 #[async_trait]
 impl RoomServicePort for AppRoomService {
+    async fn list_rooms(
+        &self,
+        _request: RoomListRequest,
+    ) -> Result<Vec<RoomSummary>, RpcGatewayError> {
+        let rooms = self
+            .rooms
+            .lock()
+            .map_err(|_| RpcGatewayError::Upstream("room map lock poisoned".to_string()))?;
+
+        Ok(rooms
+            .keys()
+            .copied()
+            .map(|room_id| RoomSummary {
+                room_id,
+                status: "active".to_string(),
+            })
+            .collect())
+    }
+
+    async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
+        let room = self.get_room(request.room_id)?;
+        room.ready(request.seat_id)
+            .await
+            .map_err(RpcGatewayError::Upstream)
+    }
+
     async fn bind_address(&self, request: RoomBindAddressRequest) -> Result<(), RpcGatewayError> {
         let room = self.get_room(request.room_id)?;
         room.bind_address(request.seat_id, request.seat_address)

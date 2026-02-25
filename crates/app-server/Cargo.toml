@@ -8,8 +8,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+agent-auth = { path = "../agent-auth" }
 anyhow.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 observability = { path = "../observability" }
 poker-domain = { path = "../poker-domain" }
 poker-engine = { path = "../poker-engine" }
