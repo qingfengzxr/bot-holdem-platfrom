@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
 poker-domain = { path = "../poker-domain" }
 serde.workspace = true
 serde_json.workspace = true

@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 agent-auth = { path = "../agent-auth" }
+async-trait.workspace = true
+chrono.workspace = true
 jsonrpsee.workspace = true
 poker-domain = { path = "../poker-domain" }
 serde.workspace = true

@@ -17,6 +17,13 @@ pub enum RoomCommand {
         seat_id: SeatId,
         seat_address: String,
     },
+    BindSessionKeys {
+        seat_id: SeatId,
+        card_encrypt_pubkey: String,
+        request_verify_pubkey: String,
+        key_algo: String,
+        proof_signature: String,
+    },
     Ready {
         seat_id: SeatId,
     },
@@ -46,6 +53,85 @@ impl RoomHandle {
 
     pub fn sender(&self) -> mpsc::Sender<RoomCommand> {
         self.sender.clone()
+    }
+
+    pub async fn join(&self, seat_id: SeatId) -> Result<(), String> {
+        self.sender
+            .send(RoomCommand::Join { seat_id })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())
+    }
+
+    pub async fn leave(&self, seat_id: SeatId) -> Result<(), String> {
+        self.sender
+            .send(RoomCommand::Leave { seat_id })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())
+    }
+
+    pub async fn bind_address(&self, seat_id: SeatId, seat_address: String) -> Result<(), String> {
+        self.sender
+            .send(RoomCommand::BindAddress {
+                seat_id,
+                seat_address,
+            })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())
+    }
+
+    pub async fn ready(&self, seat_id: SeatId) -> Result<(), String> {
+        self.sender
+            .send(RoomCommand::Ready { seat_id })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())
+    }
+
+    pub async fn bind_session_keys(
+        &self,
+        seat_id: SeatId,
+        card_encrypt_pubkey: String,
+        request_verify_pubkey: String,
+        key_algo: String,
+        proof_signature: String,
+    ) -> Result<(), String> {
+        self.sender
+            .send(RoomCommand::BindSessionKeys {
+                seat_id,
+                card_encrypt_pubkey,
+                request_verify_pubkey,
+                key_algo,
+                proof_signature,
+            })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())
+    }
+
+    pub async fn get_state(&self) -> Result<Option<HandSnapshot>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RoomCommand::GetState { reply: tx })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())?;
+        rx.await.map_err(|_| "room actor dropped reply".to_string())
+    }
+
+    pub async fn get_legal_actions(&self, seat_id: SeatId) -> Result<Vec<LegalAction>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RoomCommand::GetLegalActions { seat_id, reply: tx })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())?;
+        rx.await.map_err(|_| "room actor dropped reply".to_string())
+    }
+
+    pub async fn act(&self, action: PlayerAction) -> Result<EngineActionResult, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RoomCommand::Act { action, reply: tx })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())?;
+        rx.await
+            .map_err(|_| "room actor dropped reply".to_string())?
     }
 }
 
@@ -78,6 +164,8 @@ pub fn spawn_room_actor(room_id: RoomId, queue_capacity: usize) -> RoomHandle {
         let mut seated: HashSet<SeatId> = HashSet::new();
         let mut ready: HashSet<SeatId> = HashSet::new();
         let mut bound_addresses: HashMap<SeatId, String> = HashMap::new();
+        let mut request_pubkeys: HashMap<SeatId, String> = HashMap::new();
+        let mut card_pubkeys: HashMap<SeatId, String> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -100,10 +188,36 @@ pub fn spawn_room_actor(room_id: RoomId, queue_capacity: usize) -> RoomHandle {
                         bound_addresses.insert(seat_id, seat_address);
                     }
                 }
+                RoomCommand::BindSessionKeys {
+                    seat_id,
+                    card_encrypt_pubkey,
+                    request_verify_pubkey,
+                    key_algo,
+                    proof_signature,
+                } => {
+                    if seated.contains(&seat_id) {
+                        card_pubkeys.insert(seat_id, card_encrypt_pubkey);
+                        request_pubkeys.insert(seat_id, request_verify_pubkey);
+                        debug!(
+                            ?room_id,
+                            seat_id,
+                            key_algo,
+                            proof_sig_len = proof_signature.len(),
+                            "seat session keys bound"
+                        );
+                    }
+                }
                 RoomCommand::Ready { seat_id } => {
                     if seated.contains(&seat_id) {
                         ready.insert(seat_id);
-                        if state.snapshot.acting_seat_id.is_none() {
+                        let has_addr = bound_addresses.contains_key(&seat_id);
+                        let has_card_key = card_pubkeys.contains_key(&seat_id);
+                        let has_req_key = request_pubkeys.contains_key(&seat_id);
+                        if state.snapshot.acting_seat_id.is_none()
+                            && has_addr
+                            && has_card_key
+                            && has_req_key
+                        {
                             state.start(seat_id);
                         }
                     }

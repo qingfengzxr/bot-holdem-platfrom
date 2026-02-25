@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 observability = { path = "../observability" }
 poker-domain = { path = "../poker-domain" }
 poker-engine = { path = "../poker-engine" }

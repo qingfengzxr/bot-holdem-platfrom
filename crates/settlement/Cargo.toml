@@ -8,3 +8,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+ledger-store = { path = "../ledger-store" }
+poker-domain = { path = "../poker-domain" }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,16 +1,22 @@
 [package]
-name = "audit-store"
+name = "agent-skill"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
 rust-version.workspace = true
 
-[lints]
-workspace = true
-
 [dependencies]
+agent-auth = { path = "../agent-auth" }
 async-trait.workspace = true
 chrono.workspace = true
 poker-domain = { path = "../poker-domain" }
+rpc-gateway = { path = "../rpc-gateway" }
+seat-crypto = { path = "../seat-crypto" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use hex::FromHex;
 use poker_domain::{AgentId, RequestId, RoomId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +17,16 @@ pub enum AuthError {
     RequestFromFuture,
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("invalid public key bytes")]
+    InvalidPublicKey,
+    #[error("invalid signature bytes")]
+    InvalidSignature,
+    #[error("signature verification failed")]
+    SignatureVerificationFailed,
+    #[error("replay request detected")]
+    ReplayDetected,
+    #[error("replay store unavailable")]
+    ReplayStoreUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,6 +47,12 @@ pub struct SignedRequestMeta {
 }
 
 #[derive(Debug, Clone)]
+pub struct SignatureMaterial<'a> {
+    pub pubkey_hex: &'a str,
+    pub signature_hex: &'a str,
+}
+
+#[derive(Debug, Clone)]
 pub struct SigningMessageInput<'a> {
     pub method: &'a str,
     pub session_id: SessionId,
@@ -42,6 +61,35 @@ pub struct SigningMessageInput<'a> {
     pub action_seq: Option<u32>,
     pub params: &'a Value,
     pub meta: &'a SignedRequestMeta,
+}
+
+pub trait ReplayNonceStore: Send + Sync {
+    fn consume_once(&self, key: ReplayNonceKey) -> Result<(), AuthError>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryReplayNonceStore {
+    seen: Arc<Mutex<HashSet<ReplayNonceKey>>>,
+}
+
+impl InMemoryReplayNonceStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl ReplayNonceStore for InMemoryReplayNonceStore {
+    fn consume_once(&self, key: ReplayNonceKey) -> Result<(), AuthError> {
+        let mut seen = self
+            .seen
+            .lock()
+            .map_err(|_| AuthError::ReplayStoreUnavailable)?;
+        if !seen.insert(key) {
+            return Err(AuthError::ReplayDetected);
+        }
+        Ok(())
+    }
 }
 
 pub fn validate_request_window(
@@ -101,6 +149,36 @@ pub fn build_signing_message(input: &SigningMessageInput<'_>) -> Result<String, 
     ))
 }
 
+pub fn verify_ed25519_signature(
+    material: &SignatureMaterial<'_>,
+    message: &[u8],
+) -> Result<(), AuthError> {
+    let pubkey_bytes =
+        <[u8; 32]>::from_hex(material.pubkey_hex).map_err(|_| AuthError::InvalidPublicKey)?;
+    let sig_bytes =
+        <[u8; 64]>::from_hex(material.signature_hex).map_err(|_| AuthError::InvalidSignature)?;
+
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| AuthError::InvalidPublicKey)?;
+    let signature = Signature::from_slice(&sig_bytes).map_err(|_| AuthError::InvalidSignature)?;
+
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| AuthError::SignatureVerificationFailed)
+}
+
+pub fn consume_replay_nonce<S: ReplayNonceStore>(
+    store: &S,
+    agent_id: AgentId,
+    meta: &SignedRequestMeta,
+) -> Result<(), AuthError> {
+    store.consume_once(ReplayNonceKey {
+        agent_id,
+        request_id: meta.request_id,
+        request_nonce: meta.request_nonce.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +192,33 @@ mod tests {
 
         let actual = canonical_params_json(&input).expect("canonical json");
         assert_eq!(actual, r#"{"a":{"y":3,"z":2},"b":1}"#);
+    }
+
+    #[test]
+    fn in_memory_replay_store_rejects_duplicates() {
+        let store = InMemoryReplayNonceStore::new();
+        let key = ReplayNonceKey {
+            agent_id: AgentId::new(),
+            request_id: RequestId::new(),
+            request_nonce: "n1".to_string(),
+        };
+
+        store.consume_once(key.clone()).expect("first insert");
+        let err = store.consume_once(key).expect_err("duplicate");
+        assert_eq!(err.to_string(), AuthError::ReplayDetected.to_string());
+    }
+
+    #[test]
+    fn validate_request_window_accepts_recent_timestamp() {
+        let now = Utc::now();
+        let result = validate_request_window(now, now - Duration::seconds(1), 5_000, 5_000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_request_window_rejects_expired_timestamp() {
+        let now = Utc::now();
+        let result = validate_request_window(now, now - Duration::seconds(30), 1_000, 5_000);
+        assert!(matches!(result, Err(AuthError::RequestExpired)));
     }
 }

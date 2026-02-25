@@ -8,3 +8,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+poker-domain = { path = "../poker-domain" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
