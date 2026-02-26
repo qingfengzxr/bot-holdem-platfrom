@@ -8,10 +8,20 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+agent-auth = { path = "../agent-auth" }
 agent-sdk = { path = "../agent-sdk" }
 anyhow.workspace = true
+async-trait.workspace = true
+hex.workspace = true
 observability = { path = "../observability" }
+platform-core = { path = "../platform-core" }
 poker-domain = { path = "../poker-domain" }
+rpc-gateway = { path = "../rpc-gateway" }
+table-service = { path = "../table-service" }
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true

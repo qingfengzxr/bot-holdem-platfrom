@@ -1,0 +1,5 @@
+[app]
+service_name = "app-server-local"
+
+[observability]
+log_filter = "debug"

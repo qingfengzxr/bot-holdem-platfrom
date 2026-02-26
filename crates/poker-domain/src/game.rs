@@ -7,6 +7,7 @@ pub type SeatId = u8;
 pub type ActionSeq = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Street {
     Preflop,
     Flop,
@@ -16,6 +17,7 @@ pub enum Street {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HandStatus {
     Created,
     Running,

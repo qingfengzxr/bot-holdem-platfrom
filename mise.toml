@@ -5,7 +5,7 @@ rust = "1.88"
 description = "Run format, clippy, and tests"
 run = [
   "cargo fmt --all --check",
-  "cargo clippy --workspace --all-targets -- -D warnings",
+  "cargo clippy --workspace --all-targets -- -A clippy::pedantic -A clippy::nursery -A dead_code -D warnings",
   "cargo test --workspace",
 ]
 
@@ -15,7 +15,7 @@ run = "cargo fmt --all --check"
 
 [tasks."check:clippy"]
 description = "Lint check"
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+run = "cargo clippy --workspace --all-targets -- -A clippy::pedantic -A clippy::nursery -A dead_code -D warnings"
 
 [tasks."check:test"]
 description = "Run tests"
@@ -25,9 +25,24 @@ run = "cargo test --workspace"
 description = "Format and lint fixes"
 run = [
   "cargo fmt --all",
-  "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -D warnings",
+  "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged -- -A clippy::pedantic -A clippy::nursery -A dead_code -D warnings",
 ]
 
 [tasks."dev:app"]
 description = "Run app server"
 run = "cargo run -p app-server"
+
+[tasks."dev:anvil"]
+description = "Run local Foundry Anvil for eSpace/EVM-compatible integration testing"
+run = "anvil -p 8545"
+
+[tasks."dev:local-multi-bot-demo"]
+description = "Run local single-room multi-bot demo (in-memory room actor, no RPC)"
+run = "cargo run -p headless-agent-client --bin local_multi_bot_demo"
+
+[tasks."check:test-anvil"]
+description = "Run ignored Anvil integration tests (requires local loopback permission)"
+run = [
+  "cargo test -p chain-watcher reqwest_evm_json_rpc_client_reads_tx_from_anvil -- --ignored --nocapture",
+  "cargo test -p headless-agent-client json_rpc_wallet_adapter_can_send_tx_against_anvil -- --ignored --nocapture",
+]

@@ -1,0 +1,7 @@
+[app]
+service_name = "app-server"
+rpc_bind_addr = "0.0.0.0:9000"
+ops_http_bind_addr = "0.0.0.0:9100"
+
+[observability]
+log_filter = "info"

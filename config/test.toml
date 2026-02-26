@@ -1,0 +1,7 @@
+[app]
+service_name = "app-server-test"
+rpc_bind_addr = "127.0.0.1:19000"
+ops_http_bind_addr = "127.0.0.1:19100"
+
+[observability]
+log_filter = "warn"

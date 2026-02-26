@@ -8,6 +8,18 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+audit-store = { path = "../audit-store" }
+async-trait.workspace = true
 axum.workspace = true
+chrono.workspace = true
+ledger-store = { path = "../ledger-store" }
+poker-domain = { path = "../poker-domain" }
 serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+tokio.workspace = true

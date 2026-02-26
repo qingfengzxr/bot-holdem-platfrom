@@ -8,6 +8,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 poker-domain = { path = "../poker-domain" }
 poker-engine = { path = "../poker-engine" }
 tokio.workspace = true

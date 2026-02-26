@@ -11,11 +11,29 @@ workspace = true
 agent-auth = { path = "../agent-auth" }
 anyhow.workspace = true
 async-trait.workspace = true
+audit-store = { path = "../audit-store" }
+axum.workspace = true
+chain-watcher = { path = "../chain-watcher" }
 chrono.workspace = true
+jsonrpsee.workspace = true
+ledger-store = { path = "../ledger-store" }
 observability = { path = "../observability" }
+ops-http = { path = "../ops-http" }
+platform-core = { path = "../platform-core" }
 poker-domain = { path = "../poker-domain" }
 poker-engine = { path = "../poker-engine" }
 rpc-gateway = { path = "../rpc-gateway" }
+rs_poker.workspace = true
+reqwest.workspace = true
+seat-crypto = { path = "../seat-crypto" }
+settlement = { path = "../settlement" }
+serde_json.workspace = true
+sqlx.workspace = true
 table-service = { path = "../table-service" }
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+headless-agent-client = { path = "../headless-agent-client" }
+k256.workspace = true

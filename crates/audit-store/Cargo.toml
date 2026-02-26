@@ -13,4 +13,9 @@ chrono.workspace = true
 poker-domain = { path = "../poker-domain" }
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
