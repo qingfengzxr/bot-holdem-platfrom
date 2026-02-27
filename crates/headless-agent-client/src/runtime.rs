@@ -322,6 +322,23 @@ where
     Ok(req)
 }
 
+async fn build_signed_room_join_request<W>(
+    skill: &LocalAgentSkill,
+    cfg: &SingleActionRunnerConfig,
+    wallet: &W,
+) -> Result<RoomReadyRequest, RuntimeError>
+where
+    W: WalletAdapter + ?Sized,
+{
+    let mut req = skill
+        .build_room_ready_request()
+        .map_err(|e| RuntimeError::AgentSkill(e.to_string()))?;
+    let params = serde_json::json!({ "seat_id": req.seat_id });
+    sign_request_meta_with_wallet(cfg, wallet, "room.join", None, None, &params, &mut req.request_meta)
+        .await?;
+    Ok(req)
+}
+
 async fn build_signed_game_act_request<W>(
     skill: &LocalAgentSkill,
     cfg: &SingleActionRunnerConfig,
@@ -366,6 +383,15 @@ where
     W: WalletAdapter + ?Sized,
 {
     let mut skill = connect_skill(&cfg).await?;
+
+    let join_req = build_signed_room_join_request(&skill, &cfg, wallet).await?;
+    let join_env: ResponseEnvelope<()> = http_rpc_call(
+        &cfg.rpc_endpoint,
+        "room.join",
+        serde_json::to_value(join_req).map_err(|e| RuntimeError::Http(e.to_string()))?,
+    )
+    .await?;
+    envelope_ok_unit(join_env)?;
 
     let bind_addr_req = build_signed_bind_address_request(&mut skill, &cfg, wallet).await?;
     let bind_addr_env: ResponseEnvelope<()> = http_rpc_call(

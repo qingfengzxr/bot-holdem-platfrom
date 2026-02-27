@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -18,6 +18,7 @@ use poker_engine::EngineState;
 #[derive(Clone)]
 pub struct AppRoomService {
     rooms: Arc<Mutex<HashMap<RoomId, RoomHandle>>>,
+    joined_seats: Arc<Mutex<HashMap<RoomId, HashSet<SeatId>>>>,
     bound_addresses: Arc<Mutex<HashMap<RoomId, HashMap<SeatId, String>>>>,
     event_sink: Arc<dyn RoomEventSink>,
     chain_tx_repo: Arc<dyn ChainTxRepository>,
@@ -34,6 +35,7 @@ impl AppRoomService {
     pub fn new() -> Self {
         Self {
             rooms: Arc::default(),
+            joined_seats: Arc::default(),
             bound_addresses: Arc::default(),
             event_sink: Arc::new(NoopRoomEventSink),
             chain_tx_repo: Arc::new(NoopChainTxRepository),
@@ -44,6 +46,7 @@ impl AppRoomService {
     pub fn with_event_sink(event_sink: Arc<dyn RoomEventSink>) -> Self {
         Self {
             rooms: Arc::default(),
+            joined_seats: Arc::default(),
             bound_addresses: Arc::default(),
             event_sink,
             chain_tx_repo: Arc::new(NoopChainTxRepository),
@@ -57,6 +60,7 @@ impl AppRoomService {
     ) -> Self {
         Self {
             rooms: Arc::default(),
+            joined_seats: Arc::default(),
             bound_addresses: Arc::default(),
             event_sink,
             chain_tx_repo,
@@ -125,6 +129,23 @@ impl AppRoomService {
             .await
             .map_err(RpcGatewayError::Upstream)
     }
+
+    fn ensure_joined(&self, room_id: RoomId, seat_id: SeatId) -> Result<(), RpcGatewayError> {
+        let joined = self
+            .joined_seats
+            .lock()
+            .map_err(|_| RpcGatewayError::Upstream("joined seat map lock poisoned".to_string()))?;
+        if joined
+            .get(&room_id)
+            .is_some_and(|set| set.contains(&seat_id))
+        {
+            Ok(())
+        } else {
+            Err(RpcGatewayError::Upstream(format!(
+                "seat {seat_id} must call room.join before bind/ready"
+            )))
+        }
+    }
 }
 
 #[async_trait]
@@ -157,21 +178,33 @@ impl RoomServicePort for AppRoomService {
             .collect())
     }
 
-    async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
+    async fn join(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
         let room = self.get_room(request.room_id)?;
         room.join(request.seat_id)
             .await
             .map_err(RpcGatewayError::Upstream)?;
+        let mut joined = self
+            .joined_seats
+            .lock()
+            .map_err(|_| RpcGatewayError::Upstream("joined seat map lock poisoned".to_string()))?;
+        joined
+            .entry(request.room_id)
+            .or_default()
+            .insert(request.seat_id);
+        Ok(())
+    }
+
+    async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
+        self.ensure_joined(request.room_id, request.seat_id)?;
+        let room = self.get_room(request.room_id)?;
         room.ready(request.seat_id)
             .await
             .map_err(RpcGatewayError::Upstream)
     }
 
     async fn bind_address(&self, request: RoomBindAddressRequest) -> Result<(), RpcGatewayError> {
+        self.ensure_joined(request.room_id, request.seat_id)?;
         let room = self.get_room(request.room_id)?;
-        room.join(request.seat_id)
-            .await
-            .map_err(RpcGatewayError::Upstream)?;
         {
             let mut all = self.bound_addresses.lock().map_err(|_| {
                 RpcGatewayError::Upstream("bound address map lock poisoned".to_string())
@@ -189,10 +222,8 @@ impl RoomServicePort for AppRoomService {
         &self,
         request: RoomBindSessionKeysRequest,
     ) -> Result<(), RpcGatewayError> {
+        self.ensure_joined(request.room_id, request.seat_id)?;
         let room = self.get_room(request.room_id)?;
-        room.join(request.seat_id)
-            .await
-            .map_err(RpcGatewayError::Upstream)?;
         room.bind_session_keys(
             request.seat_id,
             request.card_encrypt_pubkey,

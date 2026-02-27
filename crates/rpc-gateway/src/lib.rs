@@ -426,6 +426,7 @@ pub trait RoomServicePort: Send + Sync {
         &self,
         request: RoomListRequest,
     ) -> Result<Vec<RoomSummary>, RpcGatewayError>;
+    async fn join(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError>;
     async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError>;
     async fn bind_address(&self, request: RoomBindAddressRequest) -> Result<(), RpcGatewayError>;
     async fn bind_session_keys(
@@ -907,7 +908,11 @@ impl RpcGateway {
                 scope: MethodScope::Agent,
                 requires_signature: false,
             },
-            "room.bind_address" | "room.bind_session_keys" | "room.ready" | "game.act" => {
+            "room.bind_address"
+            | "room.bind_session_keys"
+            | "room.join"
+            | "room.ready"
+            | "game.act" => {
                 MethodPolicy {
                     scope: MethodScope::Agent,
                     requires_signature: true,
@@ -1060,7 +1065,7 @@ impl RpcGateway {
     ) -> RpcResult<RoomSummary> {
         match room_service.create_room(request).await {
             Ok(room) => RpcResult::ok(room),
-            Err(err) => RpcResult::err(ErrorCode::RoomCreateFailed, err.to_string()),
+            Err(err) => RpcResult::err(ErrorCode::InternalError, err.to_string()),
         }
     }
 
@@ -1085,6 +1090,67 @@ impl RpcGateway {
             return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
         }
         match room_service.ready(request).await {
+            Ok(()) => RpcResult::ok(()),
+            Err(err) => RpcResult::err(ErrorCode::RoomReadyFailed, err.to_string()),
+        }
+    }
+
+    pub async fn handle_room_join<S: RoomServicePort>(
+        &self,
+        room_service: &S,
+        request: RoomReadyRequest,
+    ) -> RpcResult<()> {
+        if let Err(err) = self
+            .validate_request_meta_with_audit(
+                "room.join",
+                &request.request_meta,
+                None,
+                None,
+                Some(request.room_id),
+                None,
+                Some(request.seat_id),
+                None,
+            )
+            .await
+        {
+            return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
+        }
+        match room_service.join(request).await {
+            Ok(()) => RpcResult::ok(()),
+            Err(err) => RpcResult::err(ErrorCode::RoomReadyFailed, err.to_string()),
+        }
+    }
+
+    pub async fn handle_room_join_with_audit<S: RoomServicePort>(
+        &self,
+        room_service: &S,
+        request: RoomReadyRequest,
+        audit_sink: Option<&dyn RequestRejectAuditSink>,
+        replay_nonce_store: Option<&dyn ReplayNonceStore>,
+        signature_verifier: Option<&dyn RequestSignatureVerifier>,
+    ) -> RpcResult<()> {
+        if let Err(err) = self
+            .validate_request_meta_with_audit(
+                "room.join",
+                &request.request_meta,
+                audit_sink,
+                replay_nonce_store,
+                Some(request.room_id),
+                None,
+                Some(request.seat_id),
+                None,
+            )
+            .await
+        {
+            return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
+        }
+        if let Err(err) = self
+            .verify_room_ready_signature_with_audit(&request, signature_verifier, audit_sink)
+            .await
+        {
+            return RpcResult::err(ErrorCode::Forbidden, err.to_string());
+        }
+        match room_service.join(request).await {
             Ok(()) => RpcResult::ok(()),
             Err(err) => RpcResult::err(ErrorCode::RoomReadyFailed, err.to_string()),
         }
@@ -1372,6 +1438,16 @@ impl RpcGateway {
             .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
 
         module
+            .register_async_method("room.join", |params, ctx, _| async move {
+                let req: RoomReadyRequest = params.parse()?;
+                let gateway = RpcGateway::new();
+                Ok::<_, ErrorObjectOwned>(
+                    gateway.handle_room_join(ctx.as_ref().as_ref(), req).await,
+                )
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
+
+        module
             .register_async_method("room.ready", |params, ctx, _| async move {
                 let req: RoomReadyRequest = params.parse()?;
                 let gateway = RpcGateway::new();
@@ -1548,6 +1624,33 @@ impl RpcGateway {
                 Ok::<_, ErrorObjectOwned>(
                     gateway
                         .handle_room_list(ctx.as_ref().room_service.as_ref(), req)
+                        .await,
+                )
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
+
+        module
+            .register_async_method("room.join", |params, ctx, ext| async move {
+                let gateway = RpcGateway::new();
+                let _permit = match gateway.try_acquire_ctx_connection_permit(ctx.as_ref(), &ext) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok::<_, ErrorObjectOwned>(RpcResult::err(
+                            ErrorCode::Forbidden,
+                            err.to_string(),
+                        ));
+                    }
+                };
+                let req: RoomReadyRequest = params.parse()?;
+                Ok::<_, ErrorObjectOwned>(
+                    gateway
+                        .handle_room_join_with_audit(
+                            ctx.as_ref().room_service.as_ref(),
+                            req,
+                            ctx.as_ref().request_reject_audit_sink.as_deref(),
+                            ctx.as_ref().replay_nonce_store.as_deref(),
+                            ctx.as_ref().request_signature_verifier.as_deref(),
+                        )
                         .await,
                 )
             })
@@ -2032,6 +2135,10 @@ mod tests {
             _request: RoomListRequest,
         ) -> Result<Vec<RoomSummary>, RpcGatewayError> {
             Ok(Vec::new())
+        }
+
+        async fn join(&self, _request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
+            Ok(())
         }
 
         async fn ready(&self, _request: RoomReadyRequest) -> Result<(), RpcGatewayError> {

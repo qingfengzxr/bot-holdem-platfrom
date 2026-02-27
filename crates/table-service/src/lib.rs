@@ -477,19 +477,27 @@ pub fn spawn_room_actor_with_sink(
                 RoomCommand::Ready { seat_id } => {
                     if seated.contains(&seat_id) {
                         ready.insert(seat_id);
-                        let has_addr = bound_addresses.contains_key(&seat_id);
-                        let has_card_key = card_pubkeys.contains_key(&seat_id);
-                        let has_req_key = request_pubkeys.contains_key(&seat_id);
-                        if state.snapshot.acting_seat_id.is_none()
-                            && has_addr
-                            && has_card_key
-                            && has_req_key
-                        {
-                            state.start(seat_id);
-                            if state.hand.seated_players.len() >= 2 {
-                                if let Err(err) = engine.deal_new_hand_internal(&mut state) {
-                                    warn!(?room_id, seat_id, error = %err, "deal_new_hand_internal failed");
-                                }
+                        let mut eligible_ready: Vec<SeatId> = ready
+                            .iter()
+                            .copied()
+                            .filter(|sid| {
+                                bound_addresses.contains_key(sid)
+                                    && card_pubkeys.contains_key(sid)
+                                    && request_pubkeys.contains_key(sid)
+                            })
+                            .collect();
+                        eligible_ready.sort_unstable();
+
+                        if state.snapshot.acting_seat_id.is_none() && eligible_ready.len() >= 2 {
+                            if let Err(err) = engine.deal_new_hand_internal(&mut state) {
+                                warn!(
+                                    ?room_id,
+                                    seat_id,
+                                    ready_count = eligible_ready.len(),
+                                    error = %err,
+                                    "deal_new_hand_internal failed"
+                                );
+                                continue;
                             }
                             let new_private_events = build_hole_cards_private_events(
                                 &state,
@@ -511,31 +519,12 @@ pub fn spawn_room_actor_with_sink(
                                     room_id,
                                     state.snapshot.hand_id,
                                     &mut next_hand_event_seq,
-                                    HandEventKind::TurnStarted { seat_id },
+                                    HandEventKind::TurnStarted {
+                                        seat_id: state.snapshot.acting_seat_id.unwrap_or(seat_id),
+                                    },
                                 ),
                             ];
                             let _ = event_sink.append_hand_events(&hand_events);
-                            timeout_generation = timeout_generation.saturating_add(1);
-                            turn_scheduler = None;
-                        } else if matches!(state.snapshot.status, HandStatus::Running)
-                            && state.dealing.is_none()
-                            && state.hand.seated_players.len() >= 2
-                            && has_addr
-                            && has_card_key
-                            && has_req_key
-                        {
-                            if let Err(err) = engine.deal_new_hand_internal(&mut state) {
-                                warn!(?room_id, seat_id, error = %err, "deal_new_hand_internal late-start failed");
-                            }
-                            let new_private_events = build_hole_cards_private_events(
-                                &state,
-                                &card_pubkeys,
-                                next_hand_event_seq,
-                            );
-                            if !new_private_events.is_empty() {
-                                private_events.extend(new_private_events.clone());
-                                let _ = event_sink.append_private_events(&new_private_events);
-                            }
                             timeout_generation = timeout_generation.saturating_add(1);
                             turn_scheduler = None;
                         }
