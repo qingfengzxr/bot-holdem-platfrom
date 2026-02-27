@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+const TURN_REMINDER_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug)]
 pub enum RoomCommand {
@@ -69,6 +70,9 @@ pub enum RoomCommand {
         hand_id: HandId,
     },
     TurnTimeoutElapsed {
+        expected_generation: u64,
+    },
+    TurnReminderElapsed {
         expected_generation: u64,
     },
 }
@@ -500,6 +504,7 @@ pub fn spawn_room_actor_with_sink(
                             let _ = event_sink.append_hand_events(&hand_events);
                             timeout_generation = timeout_generation.saturating_add(1);
                             spawn_turn_timeout(actor_sender.clone(), timeout_generation);
+                            spawn_turn_reminder(actor_sender.clone(), timeout_generation);
                         } else if matches!(state.snapshot.status, HandStatus::Running)
                             && state.dealing.is_none()
                             && state.hand.seated_players.len() >= 2
@@ -521,6 +526,7 @@ pub fn spawn_room_actor_with_sink(
                             }
                             timeout_generation = timeout_generation.saturating_add(1);
                             spawn_turn_timeout(actor_sender.clone(), timeout_generation);
+                            spawn_turn_reminder(actor_sender.clone(), timeout_generation);
                         }
                     }
                 }
@@ -720,6 +726,33 @@ pub fn spawn_room_actor_with_sink(
                         },
                     ));
                 }
+                RoomCommand::TurnReminderElapsed {
+                    expected_generation,
+                } => {
+                    if expected_generation != timeout_generation {
+                        continue;
+                    }
+                    let Some(acting_seat_id) = state.snapshot.acting_seat_id else {
+                        continue;
+                    };
+                    let hand_id = state.snapshot.hand_id;
+                    let action_seq = state.snapshot.next_action_seq;
+                    warn!(
+                        ?room_id,
+                        seat_id = acting_seat_id,
+                        action_seq,
+                        "turn reminder elapsed, notifying acting seat"
+                    );
+                    let _ = event_sink.append_hand_events(&[new_hand_event(
+                        room_id,
+                        hand_id,
+                        &mut next_hand_event_seq,
+                        HandEventKind::TurnStarted {
+                            seat_id: acting_seat_id,
+                        },
+                    )]);
+                    spawn_turn_reminder(actor_sender.clone(), timeout_generation);
+                }
             }
         }
     });
@@ -801,7 +834,8 @@ fn emit_post_action_hand_events(
             },
         ));
         *timeout_generation = timeout_generation.saturating_add(1);
-        spawn_turn_timeout(actor_sender, *timeout_generation);
+        spawn_turn_timeout(actor_sender.clone(), *timeout_generation);
+        spawn_turn_reminder(actor_sender, *timeout_generation);
     } else if matches!(
         state.snapshot.status,
         HandStatus::Settled | HandStatus::Aborted
@@ -823,6 +857,17 @@ fn spawn_turn_timeout(sender: mpsc::Sender<RoomCommand>, generation: u64) {
         tokio::time::sleep(DEFAULT_STEP_TIMEOUT).await;
         let _ = sender
             .send(RoomCommand::TurnTimeoutElapsed {
+                expected_generation: generation,
+            })
+            .await;
+    });
+}
+
+fn spawn_turn_reminder(sender: mpsc::Sender<RoomCommand>, generation: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(TURN_REMINDER_INTERVAL).await;
+        let _ = sender
+            .send(RoomCommand::TurnReminderElapsed {
                 expected_generation: generation,
             })
             .await;

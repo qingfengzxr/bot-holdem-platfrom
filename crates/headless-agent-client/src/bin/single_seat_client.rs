@@ -290,10 +290,33 @@ async fn subscribe_turn_events(
         if let Some(err) = value.get("error") {
             bail!("websocket subscribe returned error: {err}");
         }
-        if let Some(subscription_id) = value.get("result").and_then(serde_json::Value::as_str) {
+        if let Some(result) = value.get("result") {
+            if let Some(subscription_id) = result.as_str() {
+                return Ok(subscription_id.to_string());
+            }
+            if let Some(subscription_id) = result.as_u64() {
+                return Ok(subscription_id.to_string());
+            }
+            if let Some(subscription_id) = result.as_i64() {
+                return Ok(subscription_id.to_string());
+            }
+        }
+        if let Some(subscription_id) = value
+            .get("result")
+            .and_then(|v| v.get("data"))
+            .and_then(serde_json::Value::as_str)
+        {
             return Ok(subscription_id.to_string());
         }
-        bail!("websocket subscribe response missing result");
+        if let Some(subscription_id) = value
+            .get("result")
+            .and_then(|v| v.get("subscription_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Ok(subscription_id.to_string());
+        }
+        let compact = serde_json::to_string(&value).unwrap_or_else(|_| "<invalid-json>".to_string());
+        bail!("websocket subscribe response missing subscription id: {compact}");
     }
 
     bail!("websocket closed before subscribe acknowledged")
