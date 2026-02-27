@@ -12,7 +12,7 @@ use poker_engine::{EngineActionResult, EngineState, PokerEngine};
 use seat_crypto::{SeatEventAad, encrypt_hole_cards_dealt_payload};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_REMINDER_INTERVAL: Duration = Duration::from_secs(20);
@@ -442,6 +442,12 @@ pub fn spawn_room_actor_with_sink(
                 } => {
                     if seated.contains(&seat_id) {
                         bound_addresses.insert(seat_id, seat_address);
+                        debug!(
+                            ?room_id,
+                            seat_id,
+                            bound_count = bound_addresses.len(),
+                            "seat address bound"
+                        );
                         let _ = event_sink.record_behavior_event(&new_behavior_event(
                             room_id,
                             AuditBehaviorEventKind::SeatAddressBound { seat_id },
@@ -487,6 +493,14 @@ pub fn spawn_room_actor_with_sink(
                             })
                             .collect();
                         eligible_ready.sort_unstable();
+                        debug!(
+                            ?room_id,
+                            seat_id,
+                            ready_count = ready.len(),
+                            eligible_ready_count = eligible_ready.len(),
+                            has_active_hand = state.snapshot.acting_seat_id.is_some(),
+                            "seat ready"
+                        );
 
                         if state.snapshot.acting_seat_id.is_none() && eligible_ready.len() >= 2 {
                             if let Err(err) = engine.deal_new_hand_internal(&mut state) {
@@ -527,6 +541,13 @@ pub fn spawn_room_actor_with_sink(
                             let _ = event_sink.append_hand_events(&hand_events);
                             timeout_generation = timeout_generation.saturating_add(1);
                             turn_scheduler = None;
+                            debug!(
+                                ?room_id,
+                                hand_id = %state.snapshot.hand_id.0,
+                                acting_seat_id = ?state.snapshot.acting_seat_id,
+                                ready_count = ready.len(),
+                                "hand started after ready quorum"
+                            );
                         }
                     }
                 }
@@ -787,6 +808,20 @@ pub fn spawn_room_actor_with_sink(
                     let now = Instant::now();
                     let hand_id = state.snapshot.hand_id;
                     let action_seq = state.snapshot.next_action_seq;
+                    let legal_actions = engine
+                        .legal_actions(&state, acting_seat_id)
+                        .into_iter()
+                        .map(|a| format!("{:?}", a.action_type).to_ascii_lowercase())
+                        .collect::<Vec<_>>();
+                    info!(
+                        room_id = %room_id.0,
+                        hand_id = %hand_id.0,
+                        status = ?state.snapshot.status,
+                        acting_seat_id,
+                        action_seq,
+                        legal_actions = ?legal_actions,
+                        "room waiting for action"
+                    );
                     let needs_reset = turn_scheduler.as_ref().is_none_or(|s| {
                         s.hand_id != hand_id
                             || s.action_seq != action_seq

@@ -11,6 +11,7 @@ use rpc_gateway::{
     to_player_action,
 };
 use table_service::{NoopRoomEventSink, RoomEventSink, RoomHandle, spawn_room_actor_with_sink};
+use tracing::{debug, info, warn};
 
 use poker_domain::{HandSnapshot, LegalAction, RoomId, SeatId};
 use poker_engine::EngineState;
@@ -77,6 +78,7 @@ impl AppRoomService {
         }
         let handle = spawn_room_actor_with_sink(room_id, 128, self.event_sink.clone());
         rooms.insert(room_id, handle.clone());
+        info!(room_id = %room_id.0, "room actor spawned");
         Ok(handle)
     }
 
@@ -141,6 +143,7 @@ impl AppRoomService {
         {
             Ok(())
         } else {
+            warn!(room_id = %room_id.0, seat_id, "seat must join before bind/ready");
             Err(RpcGatewayError::Upstream(format!(
                 "seat {seat_id} must call room.join before bind/ready"
             )))
@@ -191,15 +194,24 @@ impl RoomServicePort for AppRoomService {
             .entry(request.room_id)
             .or_default()
             .insert(request.seat_id);
+        info!(
+            room_id = %request.room_id.0,
+            seat_id = request.seat_id,
+            "room join accepted"
+        );
         Ok(())
     }
 
     async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
         self.ensure_joined(request.room_id, request.seat_id)?;
         let room = self.get_room(request.room_id)?;
-        room.ready(request.seat_id)
-            .await
-            .map_err(RpcGatewayError::Upstream)
+        room.ready(request.seat_id).await.map_err(RpcGatewayError::Upstream)?;
+        info!(
+            room_id = %request.room_id.0,
+            seat_id = request.seat_id,
+            "room ready accepted"
+        );
+        Ok(())
     }
 
     async fn bind_address(&self, request: RoomBindAddressRequest) -> Result<(), RpcGatewayError> {
@@ -215,7 +227,13 @@ impl RoomServicePort for AppRoomService {
         }
         room.bind_address(request.seat_id, request.seat_address)
             .await
-            .map_err(RpcGatewayError::Upstream)
+            .map_err(RpcGatewayError::Upstream)?;
+        info!(
+            room_id = %request.room_id.0,
+            seat_id = request.seat_id,
+            "room bind_address accepted"
+        );
+        Ok(())
     }
 
     async fn bind_session_keys(
@@ -232,7 +250,13 @@ impl RoomServicePort for AppRoomService {
             request.proof_signature,
         )
         .await
-        .map_err(RpcGatewayError::Upstream)
+        .map_err(RpcGatewayError::Upstream)?;
+        info!(
+            room_id = %request.room_id.0,
+            seat_id = request.seat_id,
+            "room bind_session_keys accepted"
+        );
+        Ok(())
     }
 
     async fn get_state(
@@ -279,6 +303,15 @@ impl RoomServicePort for AppRoomService {
         let room = self.get_room(request.room_id)?;
         let tx_hash = request.tx_hash.clone();
         let action = to_player_action(&request)?;
+        debug!(
+            room_id = %request.room_id.0,
+            hand_id = %request.hand_id.0,
+            seat_id = request.seat_id,
+            action_seq = request.action_seq,
+            action_type = %request.action_type,
+            has_tx_hash = request.tx_hash.is_some(),
+            "game act received"
+        );
         if let Some(tx_hash) = tx_hash {
             self.chain_tx_repo
                 .insert_tx_binding(&TxBindingInsert {

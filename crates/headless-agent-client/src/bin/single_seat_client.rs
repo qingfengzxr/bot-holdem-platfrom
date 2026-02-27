@@ -349,6 +349,7 @@ async fn main() -> Result<()> {
     let wallet = JsonRpcEvmWalletAdapter::new(wallet_rpc.clone());
     let chain_id = env_parse_u64("CHAIN_ID", 31_337)?;
     let policy_timeout_ms = env_parse_u64("POLICY_TIMEOUT_MS", 1_500)?;
+    let safety_poll_ms = env_parse_u64("CLIENT_SAFETY_POLL_MS", 2_000)?;
     let context_max_entries = env_parse_u64("POLICY_CONTEXT_MAX_ENTRIES", 16)? as usize;
     let policy_mode = parse_policy_mode();
     let codex_cli_bin = env_optional("CODEX_CLI_BIN").unwrap_or_else(|| "codex".to_string());
@@ -366,6 +367,7 @@ async fn main() -> Result<()> {
         room_id = %cfg.room_id.0,
         seat_id = cfg.seat_id,
         chain_id = cfg.chain_id,
+        safety_poll_ms,
         policy_mode = ?policy_mode,
         "single seat client starting"
     );
@@ -418,11 +420,25 @@ async fn main() -> Result<()> {
         )
         .await;
 
+        let mut safety_ticker = tokio::time::interval(Duration::from_millis(safety_poll_ms));
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     info!("single seat client received ctrl-c, exiting");
                     return Ok(());
+                }
+                _ = safety_ticker.tick() => {
+                    if let Err(err) = maybe_execute_turn(
+                        &cfg,
+                        &wallet,
+                        &mut decision_ctx,
+                        policy_mode,
+                        &codex_policy,
+                        &rule_policy,
+                        &mut last_attempted_turn,
+                    ).await {
+                        warn!(error = %err, "safety poll turn check failed");
+                    }
                 }
                 maybe_event = ws_stream.next() => {
                     match maybe_event {
@@ -442,6 +458,14 @@ async fn main() -> Result<()> {
                             let Ok(event) = serde_json::from_value::<EventEnvelope>(event_json.clone()) else {
                                 continue;
                             };
+                            if event.event_name == "turn_started" {
+                                info!(
+                                    room_id = %event.room_id.0,
+                                    hand_id = ?event.hand_id.map(|v| v.0),
+                                    seat_id = ?event.seat_id,
+                                    "turn started event received"
+                                );
+                            }
                             if event.event_name == "hand_closed" {
                                 info!(
                                     hand_id = ?event.hand_id.map(|v| v.0),
