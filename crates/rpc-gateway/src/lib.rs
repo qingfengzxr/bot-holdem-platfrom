@@ -1250,6 +1250,9 @@ impl RpcGateway {
         room_service: &S,
         request: GameActRequest,
     ) -> RpcResult<()> {
+        if let Err(err) = validate_game_act_funding_fields(&request) {
+            return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
+        }
         if let Err(err) = self
             .validate_request_meta_with_audit(
                 "game.act",
@@ -1279,6 +1282,9 @@ impl RpcGateway {
         replay_nonce_store: Option<&dyn ReplayNonceStore>,
         signature_verifier: Option<&dyn RequestSignatureVerifier>,
     ) -> RpcResult<()> {
+        if let Err(err) = validate_game_act_funding_fields(&request) {
+            return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
+        }
         if let Err(err) = self
             .validate_request_meta_with_audit(
                 "game.act",
@@ -1925,6 +1931,39 @@ pub fn to_player_action(request: &GameActRequest) -> Result<PlayerAction, RpcGat
     })
 }
 
+fn validate_game_act_funding_fields(request: &GameActRequest) -> Result<(), RpcGatewayError> {
+    let action_type = parse_action_type(&request.action_type)?;
+    let amount = parse_amount_u128(request.amount.as_deref())?;
+    let tx_hash_present = request
+        .tx_hash
+        .as_ref()
+        .is_some_and(|v| !v.trim().is_empty());
+
+    match action_type {
+        ActionType::Call | ActionType::RaiseTo | ActionType::AllIn => {
+            if amount.is_none() {
+                return Err(RpcGatewayError::Upstream(
+                    "amount is required for monetary action".to_string(),
+                ));
+            }
+            if !tx_hash_present {
+                return Err(RpcGatewayError::Upstream(
+                    "tx_hash is required for monetary action".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ActionType::Fold | ActionType::Check => {
+            if amount.is_some() || tx_hash_present {
+                return Err(RpcGatewayError::Upstream(
+                    "amount/tx_hash must be absent for non-monetary action".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_request_meta(meta: &SignedRequestMeta) -> Result<(), RpcGatewayError> {
     validate_request_window(Utc::now(), meta.request_ts, meta.request_expiry_ms, 5_000)
         .map_err(|err| RpcGatewayError::Upstream(err.to_string()))
@@ -2101,6 +2140,43 @@ mod tests {
             Some(Chips(42))
         );
         assert!(parse_amount_u128(Some("not-a-number")).is_err());
+    }
+
+    #[test]
+    fn validate_game_act_funding_fields_requires_amount_and_tx_for_monetary_actions() {
+        let req = GameActRequest {
+            room_id: RoomId::new(),
+            hand_id: HandId::new(),
+            action_seq: 1,
+            seat_id: 0,
+            action_type: "call".to_string(),
+            amount: None,
+            tx_hash: None,
+            request_meta: sample_meta(),
+        };
+        assert!(validate_game_act_funding_fields(&req).is_err());
+
+        let ok_req = GameActRequest {
+            amount: Some("10".to_string()),
+            tx_hash: Some("0xabc".to_string()),
+            ..req
+        };
+        assert!(validate_game_act_funding_fields(&ok_req).is_ok());
+    }
+
+    #[test]
+    fn validate_game_act_funding_fields_rejects_amount_or_tx_on_non_monetary_actions() {
+        let req = GameActRequest {
+            room_id: RoomId::new(),
+            hand_id: HandId::new(),
+            action_seq: 1,
+            seat_id: 0,
+            action_type: "check".to_string(),
+            amount: Some("1".to_string()),
+            tx_hash: None,
+            request_meta: sample_meta(),
+        };
+        assert!(validate_game_act_funding_fields(&req).is_err());
     }
 
     #[test]

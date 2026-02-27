@@ -4,6 +4,7 @@ use std::env;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::{SinkExt, StreamExt};
 use headless_agent_client::runtime::{
     SingleActionRunnerConfig, collect_turn_decision_input, execute_turn_decision, prepare_seat,
 };
@@ -15,9 +16,15 @@ use headless_agent_client::policy_adapter::{
 };
 use observability::init_tracing;
 use poker_domain::{Chips, RoomId};
-use rpc_gateway::{RoomListRequest, RoomSummary};
+use rpc_gateway::{EventEnvelope, EventTopic, RoomListRequest, RoomSummary, SubscribeRequest};
+use tokio::net::TcpStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn env_required(name: &str) -> Result<String> {
     let v = env::var(name).with_context(|| format!("missing required env: {name}"))?;
@@ -162,6 +169,136 @@ fn parse_codex_cli_args() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn derive_ws_endpoint(http_endpoint: &str) -> String {
+    if let Some(rest) = http_endpoint.strip_prefix("http://") {
+        return format!("ws://{rest}");
+    }
+    if let Some(rest) = http_endpoint.strip_prefix("https://") {
+        return format!("wss://{rest}");
+    }
+    http_endpoint.to_string()
+}
+
+async fn maybe_execute_turn<W>(
+    cfg: &SingleActionRunnerConfig,
+    wallet: &W,
+    decision_ctx: &mut DecisionContextManager,
+    policy_mode: PolicyMode,
+    codex_policy: &CodexCliPolicyAdapter,
+    rule_policy: &RulePolicyAdapter,
+    last_attempted_turn: &mut Option<(Uuid, u32)>,
+) -> Result<()>
+where
+    W: headless_agent_client::wallet_adapter::WalletAdapter + ?Sized,
+{
+    let context_json = Some(decision_ctx.as_json());
+    let Some(turn) = collect_turn_decision_input(cfg.clone(), context_json).await? else {
+        return Ok(());
+    };
+
+    let turn_key = (turn.hand_id.0, turn.action_seq);
+    if *last_attempted_turn == Some(turn_key) {
+        return Ok(());
+    }
+
+    let decision = match policy_mode {
+        PolicyMode::Rule => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),
+        PolicyMode::CodexCli => match codex_policy.decide_action(&turn.policy_input).await {
+            Ok(Some(v)) => Some(v),
+            _ => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),
+        },
+    };
+    let Some(decision) = decision else {
+        warn!("no policy decision available");
+        return Ok(());
+    };
+
+    let Ok(latest_turn) = collect_turn_decision_input(cfg.clone(), None).await else {
+        return Ok(());
+    };
+    let Some(latest_turn) = latest_turn else {
+        return Ok(());
+    };
+    if latest_turn.hand_id != turn.hand_id || latest_turn.action_seq != turn.action_seq {
+        return Ok(());
+    }
+
+    *last_attempted_turn = Some(turn_key);
+    match execute_turn_decision(cfg.clone(), wallet, &turn, &decision).await {
+        Ok(outcome) => {
+            decision_ctx.push(DecisionContextEntry {
+                hand_id: turn.hand_id,
+                seat_id: turn.policy_input.seat_id,
+                legal_actions: turn.policy_input.legal_actions.clone(),
+                chosen_action: Some(format!("{:?}", decision.action_type).to_ascii_lowercase()),
+                rationale: decision.rationale.clone(),
+            });
+            info!(
+                hand_id = %outcome.hand_id.0,
+                action_seq = outcome.action_seq,
+                tx_hash = ?outcome.tx_hash,
+                decision_source = ?decision.source,
+                "action submitted"
+            );
+        }
+        Err(err) => {
+            warn!(error = %err, "execute decision failed");
+        }
+    }
+
+    Ok(())
+}
+
+async fn connect_ws(ws_endpoint: &str) -> Result<WsStream> {
+    let (stream, _) = connect_async(ws_endpoint)
+        .await
+        .with_context(|| format!("failed to connect websocket endpoint: {ws_endpoint}"))?;
+    Ok(stream)
+}
+
+async fn subscribe_turn_events(
+    ws_stream: &mut WsStream,
+    cfg: &SingleActionRunnerConfig,
+) -> Result<String> {
+    let subscribe_req = SubscribeRequest {
+        topic: EventTopic::HandEvents,
+        room_id: cfg.room_id,
+        hand_id: None,
+        seat_id: Some(cfg.seat_id),
+    };
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1_u64,
+        "method": "subscribe.events.native",
+        "params": subscribe_req,
+    });
+    ws_stream
+        .send(Message::Text(req.to_string()))
+        .await
+        .context("failed to send websocket subscribe request")?;
+
+    while let Some(msg) = ws_stream.next().await {
+        let msg = msg.context("websocket read failed while waiting subscribe response")?;
+        if !msg.is_text() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(msg.to_text().unwrap_or_default())
+            .context("invalid websocket json frame")?;
+        if value.get("id") != Some(&serde_json::json!(1_u64)) {
+            continue;
+        }
+        if let Some(err) = value.get("error") {
+            bail!("websocket subscribe returned error: {err}");
+        }
+        if let Some(subscription_id) = value.get("result").and_then(serde_json::Value::as_str) {
+            return Ok(subscription_id.to_string());
+        }
+        bail!("websocket subscribe response missing result");
+    }
+
+    bail!("websocket closed before subscribe acknowledged")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing("single-seat-client");
@@ -169,7 +306,6 @@ async fn main() -> Result<()> {
     let wallet_rpc = env_optional("WALLET_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let wallet = JsonRpcEvmWalletAdapter::new(wallet_rpc.clone());
     let chain_id = env_parse_u64("CHAIN_ID", 31_337)?;
-    let tick_ms = env_parse_u64("TICK_MS", 800)?;
     let policy_timeout_ms = env_parse_u64("POLICY_TIMEOUT_MS", 1_500)?;
     let context_max_entries = env_parse_u64("POLICY_CONTEXT_MAX_ENTRIES", 16)? as usize;
     let policy_mode = parse_policy_mode();
@@ -178,14 +314,16 @@ async fn main() -> Result<()> {
     let rpc_endpoint = env_required("RPC_ENDPOINT")?;
     let room_id = resolve_room_id(&rpc_endpoint, env_parse_room_id_optional("ROOM_ID")?).await?;
     let cfg = build_config(chain_id, room_id)?;
+    let ws_endpoint =
+        env_optional("RPC_WS_ENDPOINT").unwrap_or_else(|| derive_ws_endpoint(&cfg.rpc_endpoint));
 
     info!(
         rpc_endpoint = %cfg.rpc_endpoint,
+        ws_endpoint = %ws_endpoint,
         wallet_rpc = %wallet_rpc,
         room_id = %cfg.room_id.0,
         seat_id = cfg.seat_id,
         chain_id = cfg.chain_id,
-        tick_ms,
         policy_mode = ?policy_mode,
         "single seat client starting"
     );
@@ -194,6 +332,7 @@ async fn main() -> Result<()> {
     info!("seat prepared, entering action loop");
 
     let mut decision_ctx = DecisionContextManager::with_max_entries(context_max_entries);
+    let mut last_attempted_turn: Option<(Uuid, u32)> = None;
     let codex_policy = CodexCliPolicyAdapter::new(
         codex_cli_bin,
         codex_cli_args,
@@ -201,69 +340,102 @@ async fn main() -> Result<()> {
     );
     let rule_policy = RulePolicyAdapter;
 
-    let mut ticker = tokio::time::interval(Duration::from_millis(tick_ms));
+    let mut reconnect_backoff_ms = 500_u64;
     loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("single seat client received ctrl-c, exiting");
-                break;
+        let mut ws_stream = match connect_ws(&ws_endpoint).await {
+            Ok(stream) => {
+                reconnect_backoff_ms = 500;
+                stream
             }
-            _ = ticker.tick() => {
-                let context_json = Some(decision_ctx.as_json());
-                match collect_turn_decision_input(cfg.clone(), context_json).await {
-                    Ok(Some(turn)) => {
-                        let decision = match policy_mode {
-                            PolicyMode::Rule => rule_policy
-                                .decide_action(&turn.policy_input)
-                                .await
-                                .ok()
-                                .flatten(),
-                            PolicyMode::CodexCli => match codex_policy
-                                .decide_action(&turn.policy_input)
-                                .await
-                            {
-                                Ok(Some(v)) => Some(v),
-                                _ => rule_policy
-                                    .decide_action(&turn.policy_input)
-                                    .await
-                                    .ok()
-                                    .flatten(),
-                            },
-                        };
-                        let Some(decision) = decision else {
-                            warn!("no policy decision available");
-                            continue;
-                        };
-                        match execute_turn_decision(cfg.clone(), &wallet, &turn, &decision).await {
-                            Ok(outcome) => {
-                                decision_ctx.push(DecisionContextEntry {
-                                    hand_id: turn.hand_id,
-                                    seat_id: turn.policy_input.seat_id,
-                                    legal_actions: turn.policy_input.legal_actions.clone(),
-                                    chosen_action: Some(format!("{:?}", decision.action_type).to_ascii_lowercase()),
-                                    rationale: decision.rationale.clone(),
-                                });
-                                info!(
-                                    hand_id = %outcome.hand_id.0,
-                                    action_seq = outcome.action_seq,
-                                    tx_hash = ?outcome.tx_hash,
-                                    decision_source = ?decision.source,
-                                    "action submitted"
-                                );
+            Err(err) => {
+                warn!(error = %err, backoff_ms = reconnect_backoff_ms, "websocket connect failed");
+                tokio::time::sleep(Duration::from_millis(reconnect_backoff_ms)).await;
+                reconnect_backoff_ms = (reconnect_backoff_ms.saturating_mul(2)).min(10_000);
+                continue;
+            }
+        };
+
+        let subscription_id = match subscribe_turn_events(&mut ws_stream, &cfg).await {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "subscribe events failed");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        info!(subscription_id = %subscription_id, "subscribed to turn events");
+
+        let _ = maybe_execute_turn(
+            &cfg,
+            &wallet,
+            &mut decision_ctx,
+            policy_mode,
+            &codex_policy,
+            &rule_policy,
+            &mut last_attempted_turn,
+        )
+        .await;
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("single seat client received ctrl-c, exiting");
+                    return Ok(());
+                }
+                maybe_event = ws_stream.next() => {
+                    match maybe_event {
+                        Some(Ok(Message::Text(text))) => {
+                            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                                continue;
+                            };
+                            let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
+                                continue;
+                            };
+                            if method != "events" {
+                                continue;
                             }
-                            Err(err) => {
-                                warn!(error = %err, "execute decision failed");
+                            let Some(event_json) = value.get("params").and_then(|p| p.get("result")) else {
+                                continue;
+                            };
+                            let Ok(event) = serde_json::from_value::<EventEnvelope>(event_json.clone()) else {
+                                continue;
+                            };
+                            if event.event_name != "turn_started" {
+                                continue;
+                            }
+                            if let Err(err) = maybe_execute_turn(
+                                &cfg,
+                                &wallet,
+                                &mut decision_ctx,
+                                policy_mode,
+                                &codex_policy,
+                                &rule_policy,
+                                &mut last_attempted_turn,
+                            ).await {
+                                warn!(error = %err, "collect turn input failed");
                             }
                         }
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, "collect turn input failed");
+                        Some(Ok(Message::Ping(payload))) => {
+                            if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            warn!("event websocket closed by server, reconnecting");
+                            break;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(err)) => {
+                            warn!(error = %err, "event subscription stream failed, reconnecting");
+                            break;
+                        }
+                        None => {
+                            warn!("event subscription closed, reconnecting");
+                            break;
+                        }
                     }
                 }
             }
         }
     }
-
-    Ok(())
 }

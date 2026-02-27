@@ -63,6 +63,7 @@ pub struct TurnDecisionInput {
     pub policy_input: PolicyDecisionInput,
     pub hand_id: poker_domain::HandId,
     pub action_seq: u32,
+    pub legal_actions_raw: Vec<LegalAction>,
 }
 
 pub struct SeatTurnRunnerInput<'a> {
@@ -444,8 +445,9 @@ pub async fn collect_turn_decision_input(
         serde_json::to_value(legal_req).map_err(|e| RuntimeError::Http(e.to_string()))?,
     )
     .await?;
-    let legal_actions = envelope_ok(legal_env)?
-        .into_iter()
+    let legal_actions_raw = envelope_ok(legal_env)?;
+    let legal_actions = legal_actions_raw
+        .iter()
         .map(|a| format!("{:?}", a.action_type).to_lowercase())
         .collect::<Vec<_>>();
     let private_payload_req = GameGetPrivatePayloadsRequest {
@@ -476,7 +478,31 @@ pub async fn collect_turn_decision_input(
         },
         hand_id: state.hand_id,
         action_seq: state.next_action_seq,
+        legal_actions_raw,
     }))
+}
+
+fn resolve_action_amount_from_legal_actions(
+    decision: &crate::policy_adapter::PolicyDecision,
+    legal_actions_raw: &[LegalAction],
+) -> Result<Option<Chips>, RuntimeError> {
+    if decision.amount.is_some() {
+        return Ok(decision.amount);
+    }
+
+    match decision.action_type {
+        ActionType::Call => {
+            let call = legal_actions_raw
+                .iter()
+                .find(|a| a.action_type == ActionType::Call)
+                .ok_or_else(|| RuntimeError::Policy("call not present in legal actions".to_string()))?;
+            Ok(call.min_amount)
+        }
+        ActionType::RaiseTo | ActionType::AllIn => Err(RuntimeError::Policy(
+            "raise_to/all_in requires explicit amount".to_string(),
+        )),
+        ActionType::Fold | ActionType::Check => Ok(None),
+    }
 }
 
 pub async fn execute_turn_decision<W>(
@@ -490,8 +516,9 @@ where
 {
     let skill = connect_skill(&cfg).await?;
 
-    let amount = decision.amount.map(|v| v.as_u128().to_string());
-    let tx_hash = if let Some(amount_chips) = decision.amount {
+    let resolved_amount = resolve_action_amount_from_legal_actions(decision, &turn.legal_actions_raw)?;
+    let amount = resolved_amount.map(|v| v.as_u128().to_string());
+    let tx_hash = if let Some(amount_chips) = resolved_amount {
         let tx_receipt = wallet
             .transfer_to_room(EvmTransferRequest {
                 room_id: cfg.room_id,

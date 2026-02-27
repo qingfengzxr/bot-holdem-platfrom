@@ -52,8 +52,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Run single_seat_client with codex wrapper and auto-generated x25519 keys."
     )
-    p.add_argument("--rpc-endpoint", default="http://127.0.0.1:9000")
-    p.add_argument("--wallet-rpc-url", default="http://127.0.0.1:8545")
+    p.add_argument("--rpc-endpoint", default="http://31.97.48.104:9000")
+    p.add_argument(
+        "--rpc-timeout-sec",
+        type=float,
+        default=10.0,
+        help="timeout seconds for JSON-RPC calls to game server/wallet RPC",
+    )
+    p.add_argument("--wallet-rpc-url", default="http://31.97.48.104:8545")
     p.add_argument("--room-id", help="UUID room id; optional, auto-select via room.list when omitted")
     p.add_argument(
         "--auto-create-room",
@@ -88,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _json_rpc_call(url: str, method: str, params: Any) -> Any:
+def _json_rpc_call(url: str, method: str, params: Any, timeout_sec: float = 10.0) -> Any:
     payload = json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     ).encode()
@@ -98,8 +104,15 @@ def _json_rpc_call(url: str, method: str, params: Any) -> Any:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with request.urlopen(req, timeout=5) as resp:
-        body = json.loads(resp.read().decode())
+    try:
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            body = json.loads(resp.read().decode())
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"json-rpc {method} timeout after {timeout_sec}s (url={url})"
+        ) from exc
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"json-rpc {method} connect error (url={url}): {exc}") from exc
     if body.get("error"):
         raise RuntimeError(f"json-rpc {method} error: {body['error']}")
     if "result" not in body:
@@ -111,7 +124,9 @@ def _resolve_seat_address(args: argparse.Namespace) -> str:
     if args.seat_address:
         return args.seat_address
     try:
-        accounts = _json_rpc_call(args.wallet_rpc_url, "eth_accounts", [])
+        accounts = _json_rpc_call(
+            args.wallet_rpc_url, "eth_accounts", [], args.rpc_timeout_sec
+        )
     except urlerror.URLError as exc:
         raise RuntimeError(
             "cannot reach WALLET_RPC_URL while resolving seat address: "
@@ -166,7 +181,10 @@ def _resolve_room_id(args: argparse.Namespace) -> str | None:
     if args.dry_run:
         return None
     list_result = _json_rpc_call(
-        args.rpc_endpoint, "room.list", {"include_inactive": True}
+        args.rpc_endpoint,
+        "room.list",
+        {"include_inactive": True},
+        args.rpc_timeout_sec,
     )
     room_list = _extract_ok_data(list_result, "room.list")
     picked = _select_room_id_from_list_result(room_list)
@@ -174,7 +192,9 @@ def _resolve_room_id(args: argparse.Namespace) -> str | None:
         return picked
     if not args.auto_create_room:
         return None
-    create_result = _json_rpc_call(args.rpc_endpoint, "room.create", {})
+    create_result = _json_rpc_call(
+        args.rpc_endpoint, "room.create", {}, args.rpc_timeout_sec
+    )
     created = _extract_ok_data(create_result, "room.create")
     if not isinstance(created, dict) or not isinstance(created.get("room_id"), str):
         raise RuntimeError("room.create succeeded but returned invalid room summary")
@@ -192,7 +212,11 @@ def main() -> int:
         room_chain_address = args.room_chain_address or seat_address
         room_id = _resolve_room_id(args)
     except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(
+            "error: "
+            f"{exc}. rpc_endpoint={args.rpc_endpoint} wallet_rpc_url={args.wallet_rpc_url}",
+            file=sys.stderr,
+        )
         return 2
 
     env = os.environ.copy()

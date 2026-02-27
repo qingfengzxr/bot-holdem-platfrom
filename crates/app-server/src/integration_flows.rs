@@ -644,19 +644,21 @@ mod tests {
         let room_id = RoomId::new();
         let room = room_service.ensure_room(room_id).expect("room");
 
-        room.join(0).await.expect("join");
-        room.bind_address(0, "cfx:seat0".to_string())
+        for seat_id in [0, 1] {
+            room.join(seat_id).await.expect("join");
+            room.bind_address(seat_id, format!("cfx:seat{seat_id}"))
+                .await
+                .expect("bind");
+            room.bind_session_keys(
+                seat_id,
+                format!("encpk{seat_id}"),
+                format!("sigpk{seat_id}"),
+                "x25519+evm".to_string(),
+                format!("proof{seat_id}"),
+            )
             .await
-            .expect("bind");
-        room.bind_session_keys(
-            0,
-            "encpk".to_string(),
-            "sigpk".to_string(),
-            "x25519+evm".to_string(),
-            "proof".to_string(),
-        )
-        .await
-        .expect("keys");
+            .expect("keys");
+        }
         room.ready(0).await.expect("ready");
 
         let before = room.get_state().await.expect("state").expect("snapshot");
@@ -669,8 +671,8 @@ mod tests {
                     hand_id: before.hand_id,
                     action_seq: before.next_action_seq,
                     seat_id: before.acting_seat_id.expect("seat"),
-                    action_type: "check".to_string(),
-                    amount: None,
+                    action_type: "call".to_string(),
+                    amount: Some("100000000000000".to_string()),
                     tx_hash: Some(tx_hash.clone()),
                     request_meta: signed_meta(),
                 },
