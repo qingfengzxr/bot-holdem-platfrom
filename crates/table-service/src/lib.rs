@@ -246,6 +246,8 @@ pub struct ChainTxVerifiedCallback {
 #[derive(Debug, Clone)]
 struct PendingChainAction {
     action: PlayerAction,
+    queued_at: Instant,
+    last_warn_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -600,8 +602,15 @@ pub fn spawn_room_actor_with_sink(
                 } => {
                     let queued_action = action.clone();
                     let _ = pending_chain_actions
-                        .insert(tx_hash.clone(), PendingChainAction { action });
-                    debug!(
+                        .insert(
+                            tx_hash.clone(),
+                            PendingChainAction {
+                                action,
+                                queued_at: Instant::now(),
+                                last_warn_at: None,
+                            },
+                        );
+                    info!(
                         ?room_id,
                         hand_id = %queued_action.hand_id.0,
                         seat_id = queued_action.seat_id,
@@ -629,7 +638,7 @@ pub fn spawn_room_actor_with_sink(
                         && let Some(pending) = pending_chain_actions.remove(&callback.tx_hash)
                     {
                         let submitted_action = pending.action.clone();
-                        debug!(
+                        info!(
                             ?room_id,
                             hand_id = %submitted_action.hand_id.0,
                             seat_id = submitted_action.seat_id,
@@ -654,7 +663,6 @@ pub fn spawn_room_actor_with_sink(
                             turn_scheduler = None;
                         }
                     }
-
                     if matches!(callback.status.as_str(), "failed" | "unmatched")
                         && callback.hand_id == Some(state.snapshot.hand_id)
                         && matches!(
@@ -674,6 +682,15 @@ pub fn spawn_room_actor_with_sink(
                         )]);
                         timeout_generation = timeout_generation.saturating_add(1);
                         turn_scheduler = None;
+                    }
+                    if matches!(callback.status.as_str(), "failed" | "unmatched") {
+                        warn!(
+                            ?room_id,
+                            tx_hash = %callback.tx_hash,
+                            status = %callback.status,
+                            failure_reason = ?callback.failure_reason,
+                            "chain callback indicates action not executable"
+                        );
                     }
 
                     let _ = event_sink.record_behavior_event(&new_behavior_event(
@@ -796,6 +813,27 @@ pub fn spawn_room_actor_with_sink(
                     )]);
                 }
                 RoomCommand::SchedulerTick => {
+                    let now = Instant::now();
+                    for (tx_hash, pending) in &mut pending_chain_actions {
+                        let age = now.duration_since(pending.queued_at);
+                        if age >= Duration::from_secs(10) {
+                            let should_warn = pending
+                                .last_warn_at
+                                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10));
+                            if should_warn {
+                                pending.last_warn_at = Some(now);
+                                warn!(
+                                    ?room_id,
+                                    tx_hash = %tx_hash,
+                                    hand_id = %pending.action.hand_id.0,
+                                    seat_id = pending.action.seat_id,
+                                    action_seq = pending.action.action_seq,
+                                    pending_age_secs = age.as_secs(),
+                                    "pending chain action still waiting for verification callback"
+                                );
+                            }
+                        }
+                    }
                     let Some(acting_seat_id) = state.snapshot.acting_seat_id else {
                         turn_scheduler = None;
                         continue;
@@ -805,7 +843,6 @@ pub fn spawn_room_actor_with_sink(
                         continue;
                     }
 
-                    let now = Instant::now();
                     let hand_id = state.snapshot.hand_id;
                     let action_seq = state.snapshot.next_action_seq;
                     let legal_actions = engine
