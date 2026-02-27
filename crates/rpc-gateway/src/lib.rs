@@ -908,16 +908,16 @@ impl RpcGateway {
                 scope: MethodScope::Agent,
                 requires_signature: false,
             },
-            "room.bind_address"
-            | "room.bind_session_keys"
-            | "room.join"
-            | "room.ready"
-            | "game.act" => {
+            "room.bind_address" | "room.bind_session_keys" | "room.ready" | "game.act" => {
                 MethodPolicy {
                     scope: MethodScope::Agent,
                     requires_signature: true,
                 }
             }
+            "room.join" => MethodPolicy {
+                scope: MethodScope::Agent,
+                requires_signature: false,
+            },
             "admin.dump_state" => MethodPolicy {
                 scope: MethodScope::Admin,
                 requires_signature: true,
@@ -1144,12 +1144,7 @@ impl RpcGateway {
         {
             return RpcResult::err(ErrorCode::RequestInvalid, err.to_string());
         }
-        if let Err(err) = self
-            .verify_room_ready_signature_with_audit(&request, signature_verifier, audit_sink)
-            .await
-        {
-            return RpcResult::err(ErrorCode::Forbidden, err.to_string());
-        }
+        let _ = (signature_verifier, audit_sink);
         match room_service.join(request).await {
             Ok(()) => RpcResult::ok(()),
             Err(err) => RpcResult::err(ErrorCode::RoomReadyFailed, err.to_string()),
