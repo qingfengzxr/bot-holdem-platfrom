@@ -7,7 +7,8 @@ use ledger_store::{
 };
 use poker_engine::{EngineState, PokerEngine, ShowdownInput};
 use settlement::{
-    RakePolicy, SettlementService, SettlementTransferSubmission, SettlementTxStatus,
+    BatchSettlementWalletAdapter, BatchSettlementTransferSubmission, RakePolicy, SettlementService,
+    SettlementTransferSubmission, SettlementTransferReceipt, SettlementTxStatus,
     SettlementWalletAdapter, mark_failed_receipts_for_manual_review,
 };
 use table_service::RoomHandle;
@@ -169,6 +170,11 @@ pub struct DirectPayoutSettlementInput<'a> {
     pub min_confirmations: u64,
 }
 
+pub struct BatchPayoutSettlementInput<'a> {
+    pub seat_addresses: &'a std::collections::HashMap<poker_domain::SeatId, String>,
+    pub min_confirmations: u64,
+}
+
 pub async fn run_showdown_settlement_with_direct_payouts<L, P, S, W>(
     engine: &PokerEngine,
     settlement_service: &SettlementService<L>,
@@ -308,6 +314,132 @@ where
     Ok(plan)
 }
 
+pub async fn run_showdown_settlement_with_batch_payouts_and_alerts<L, P, S, W>(
+    engine: &PokerEngine,
+    settlement_service: &SettlementService<L>,
+    settlement_repo: &S,
+    wallet: &W,
+    room_port: &P,
+    state: &EngineState,
+    showdown_input: &ShowdownInput,
+    rake_policy: RakePolicy,
+    batch: BatchPayoutSettlementInput<'_>,
+    trace_id: poker_domain::TraceId,
+    alert_sink: Option<&dyn SettlementAlertSink>,
+    audit_sink: Option<&dyn SettlementAuditSink>,
+) -> Result<settlement::SettlementPlan, String>
+where
+    L: ledger_store::LedgerRepository,
+    P: SettlementLifecyclePort,
+    S: SettlementPersistenceRepository,
+    W: BatchSettlementWalletAdapter,
+{
+    let plan = build_settlement_plan_from_showdown(
+        engine,
+        settlement_service,
+        state,
+        showdown_input,
+        rake_policy,
+    )?;
+    let settlement_plan_id = Uuid::now_v7();
+    settlement_repo
+        .insert_settlement_plan(&SettlementPlanRecordInsert {
+            settlement_plan_id,
+            room_id: state.snapshot.room_id,
+            hand_id: state.snapshot.hand_id,
+            status: "created".to_string(),
+            rake_amount: plan.rake_amount,
+            payout_total: plan
+                .payout_total()
+                .map_err(|e| format!("settlement payout_total failed: {e}"))?,
+            payload_json: serde_json::to_value(&plan).map_err(|e| e.to_string())?,
+            created_at: Utc::now(),
+            finalized_at: None,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    settlement_service
+        .record_plan(&plan, trace_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let submission = settlement_service
+        .submit_batch_payouts(&plan, batch.seat_addresses, wallet)
+        .await
+        .map_err(|e| e.to_string())?;
+    persist_batch_submission_record(settlement_repo, settlement_plan_id, state, &submission).await?;
+    emit_batch_submission_audit(audit_sink, state, &submission, trace_id).await;
+
+    let receipt = settlement_service
+        .check_batch_payout_submission(wallet, &submission, batch.min_confirmations)
+        .await
+        .map_err(|e| e.to_string())?;
+    persist_receipt_status_updates(
+        settlement_repo,
+        &[SettlementTransferReceipt {
+            tx_hash: receipt.tx_hash.clone(),
+            status: receipt.status,
+            confirmations: receipt.confirmations,
+        }],
+    )
+    .await?;
+    emit_batch_receipt_audit(audit_sink, state, &receipt, trace_id).await;
+
+    if matches!(receipt.status, SettlementTxStatus::Failed) {
+        let _ = mark_failed_receipts_for_manual_review(
+            settlement_repo,
+            &[SettlementTransferReceipt {
+                tx_hash: receipt.tx_hash.clone(),
+                status: receipt.status,
+                confirmations: receipt.confirmations,
+            }],
+            1,
+            "manual review required after failed batch payout receipt",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        emit_manual_review_audits(
+            audit_sink,
+            state,
+            &[SettlementTransferReceipt {
+                tx_hash: receipt.tx_hash.clone(),
+                status: receipt.status,
+                confirmations: receipt.confirmations,
+            }],
+            trace_id,
+        )
+        .await;
+        emit_failed_payout_alerts(
+            alert_sink,
+            state,
+            &[SettlementTransferReceipt {
+                tx_hash: receipt.tx_hash.clone(),
+                status: receipt.status,
+                confirmations: receipt.confirmations,
+            }],
+        )
+        .await;
+    }
+
+    let all_confirmed = matches!(receipt.status, SettlementTxStatus::Confirmed);
+    if all_confirmed {
+        room_port
+            .complete_settlement(state.snapshot.hand_id)
+            .await
+            .map_err(|e| format!("complete settlement failed: {e}"))?;
+    }
+
+    info!(
+        room_id = %state.snapshot.room_id.0,
+        hand_id = %state.snapshot.hand_id.0,
+        batch_tx_hash = %submission.tx_hash,
+        transfer_count = submission.transfer_count,
+        all_confirmed,
+        "batch payout settlement orchestrated"
+    );
+    Ok(plan)
+}
+
 async fn emit_behavior(audit_sink: Option<&dyn SettlementAuditSink>, record: BehaviorEventRecord) {
     if let Some(sink) = audit_sink {
         if let Err(err) = sink.emit(record).await {
@@ -348,6 +480,36 @@ async fn emit_settlement_submission_audits(
     }
 }
 
+async fn emit_batch_submission_audit(
+    audit_sink: Option<&dyn SettlementAuditSink>,
+    state: &EngineState,
+    submission: &BatchSettlementTransferSubmission,
+    trace_id: poker_domain::TraceId,
+) {
+    emit_behavior(
+        audit_sink,
+        BehaviorEventRecord {
+            behavior_event_id: Uuid::now_v7().to_string(),
+            event_kind: "settlement_batch_submitted".to_string(),
+            event_source: "settlement_orchestrator".to_string(),
+            room_id: Some(state.snapshot.room_id),
+            hand_id: Some(state.snapshot.hand_id),
+            seat_id: None,
+            action_seq: None,
+            related_attempt_id: None,
+            related_tx_hash: Some(submission.tx_hash.clone()),
+            severity: "info".to_string(),
+            payload_json: serde_json::json!({
+                "tx_hash": submission.tx_hash,
+                "transfer_count": submission.transfer_count,
+            }),
+            occurred_at: Utc::now(),
+            trace_id,
+        },
+    )
+    .await;
+}
+
 async fn emit_settlement_receipt_audits(
     audit_sink: Option<&dyn SettlementAuditSink>,
     state: &EngineState,
@@ -384,6 +546,41 @@ async fn emit_settlement_receipt_audits(
         )
         .await;
     }
+}
+
+async fn emit_batch_receipt_audit(
+    audit_sink: Option<&dyn SettlementAuditSink>,
+    state: &EngineState,
+    receipt: &settlement::BatchSettlementTransferReceipt,
+    trace_id: poker_domain::TraceId,
+) {
+    emit_behavior(
+        audit_sink,
+        BehaviorEventRecord {
+            behavior_event_id: Uuid::now_v7().to_string(),
+            event_kind: "settlement_batch_receipt".to_string(),
+            event_source: "settlement_orchestrator".to_string(),
+            room_id: Some(state.snapshot.room_id),
+            hand_id: Some(state.snapshot.hand_id),
+            seat_id: None,
+            action_seq: None,
+            related_attempt_id: None,
+            related_tx_hash: Some(receipt.tx_hash.clone()),
+            severity: if matches!(receipt.status, SettlementTxStatus::Failed) {
+                "warn".to_string()
+            } else {
+                "info".to_string()
+            },
+            payload_json: serde_json::json!({
+                "status": format!("{:?}", receipt.status),
+                "confirmations": receipt.confirmations,
+                "applied_count": receipt.applied_count,
+            }),
+            occurred_at: Utc::now(),
+            trace_id,
+        },
+    )
+    .await;
 }
 
 async fn emit_manual_review_audits(
@@ -481,6 +678,29 @@ async fn persist_submission_records<S: SettlementPersistenceRepository>(
     Ok(())
 }
 
+async fn persist_batch_submission_record<S: SettlementPersistenceRepository>(
+    settlement_repo: &S,
+    settlement_plan_id: Uuid,
+    state: &EngineState,
+    submission: &BatchSettlementTransferSubmission,
+) -> Result<(), String> {
+    settlement_repo
+        .insert_settlement_record(&SettlementRecordInsert {
+            settlement_record_id: Uuid::now_v7(),
+            settlement_plan_id,
+            room_id: state.snapshot.room_id,
+            hand_id: state.snapshot.hand_id,
+            tx_hash: Some(submission.tx_hash.clone()),
+            settlement_status: "submitted".to_string(),
+            retry_count: 0,
+            error_detail: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn persist_receipt_status_updates<S: SettlementPersistenceRepository>(
     settlement_repo: &S,
     receipts: &[settlement::SettlementTransferReceipt],
@@ -532,6 +752,12 @@ mod tests {
     }
 
     #[derive(Debug, Default, Clone)]
+    struct FakeBatchWallet {
+        confirmations: u64,
+        fail: bool,
+    }
+
+    #[derive(Debug, Default, Clone)]
     struct FakeAlertSink {
         alerts: Arc<Mutex<Vec<SettlementAlert>>>,
     }
@@ -577,6 +803,32 @@ mod tests {
                     settlement::SettlementTxStatus::Confirmed
                 },
                 confirmations: self.confirmations,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl BatchSettlementWalletAdapter for FakeBatchWallet {
+        async fn submit_batch_transfer(
+            &self,
+            _request: &settlement::BatchSettlementTransferRequest,
+        ) -> Result<String, String> {
+            Ok("0xbatch".to_string())
+        }
+
+        async fn get_batch_transfer_receipt(
+            &self,
+            tx_hash: &str,
+        ) -> Result<settlement::BatchSettlementTransferReceipt, String> {
+            Ok(settlement::BatchSettlementTransferReceipt {
+                tx_hash: tx_hash.to_string(),
+                status: if self.fail {
+                    settlement::SettlementTxStatus::Failed
+                } else {
+                    settlement::SettlementTxStatus::Confirmed
+                },
+                confirmations: self.confirmations,
+                applied_count: 2,
             })
         }
     }
@@ -853,6 +1105,142 @@ mod tests {
         assert_eq!(settlement_repo.settlement_records_len(), 2);
         let completed = room_port.completed.lock().expect("lock");
         assert_eq!(completed.as_slice(), &[state.snapshot.hand_id]);
+    }
+
+    #[tokio::test]
+    async fn orchestrates_batch_payouts_and_closes_when_confirmed() {
+        let engine = PokerEngine::new();
+        let ledger = InMemoryLedgerRepository::new();
+        let settlement_service = SettlementService::new(ledger);
+        let settlement_repo = InMemorySettlementPersistenceRepository::new();
+        let room_port = FakeRoomPort::default();
+        let wallet = FakeBatchWallet {
+            confirmations: 6,
+            fail: false,
+        };
+
+        let mut state = EngineState::new(RoomId::new(), 1);
+        state.pot.player_contributions.insert(0, Chips(10));
+        state.pot.player_contributions.insert(1, Chips(10));
+        state.pot.main_pot = Chips(20);
+        state.snapshot.pot_total = Chips(20);
+
+        let board = FlatHand::new_from_str("AhKhQhJhTh")
+            .expect("board")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let seat0 = FlatHand::new_from_str("2c3d").expect("s0");
+        let seat1 = FlatHand::new_from_str("4s5c").expect("s1");
+        let showdown = ShowdownInput {
+            board,
+            revealed_hole_cards: vec![(0, [seat0[0], seat0[1]]), (1, [seat1[0], seat1[1]])],
+        };
+        let mut seat_addresses = std::collections::HashMap::new();
+        seat_addresses.insert(0_u8, "0xseat0".to_string());
+        seat_addresses.insert(1_u8, "0xseat1".to_string());
+
+        let _ = run_showdown_settlement_with_batch_payouts_and_alerts(
+            &engine,
+            &settlement_service,
+            &settlement_repo,
+            &wallet,
+            &room_port,
+            &state,
+            &showdown,
+            RakePolicy::zero(),
+            BatchPayoutSettlementInput {
+                seat_addresses: &seat_addresses,
+                min_confirmations: 1,
+            },
+            poker_domain::TraceId::new(),
+            None,
+            None,
+        )
+        .await
+        .expect("orchestrated");
+
+        assert_eq!(settlement_repo.settlement_plans_len(), 1);
+        assert_eq!(settlement_repo.settlement_records_len(), 1);
+        let completed = room_port.completed.lock().expect("lock");
+        assert_eq!(completed.as_slice(), &[state.snapshot.hand_id]);
+    }
+
+    #[tokio::test]
+    async fn batch_payouts_failed_receipt_marks_manual_review_and_emits_alert() {
+        let engine = PokerEngine::new();
+        let ledger = InMemoryLedgerRepository::new();
+        let settlement_service = SettlementService::new(ledger);
+        let settlement_repo = InMemorySettlementPersistenceRepository::new();
+        let room_port = FakeRoomPort::default();
+        let wallet = FakeBatchWallet {
+            confirmations: 6,
+            fail: true,
+        };
+        let alert_sink = FakeAlertSink::default();
+        let audit_sink = FakeSettlementAuditSink::default();
+
+        let mut state = EngineState::new(RoomId::new(), 1);
+        state.pot.player_contributions.insert(0, Chips(10));
+        state.pot.player_contributions.insert(1, Chips(10));
+        state.pot.main_pot = Chips(20);
+        state.snapshot.pot_total = Chips(20);
+
+        let board = FlatHand::new_from_str("AhKhQhJhTh")
+            .expect("board")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let seat0 = FlatHand::new_from_str("2c3d").expect("s0");
+        let seat1 = FlatHand::new_from_str("4s5c").expect("s1");
+        let showdown = ShowdownInput {
+            board,
+            revealed_hole_cards: vec![(0, [seat0[0], seat0[1]]), (1, [seat1[0], seat1[1]])],
+        };
+        let mut seat_addresses = std::collections::HashMap::new();
+        seat_addresses.insert(0_u8, "0xseat0".to_string());
+        seat_addresses.insert(1_u8, "0xseat1".to_string());
+
+        let _ = run_showdown_settlement_with_batch_payouts_and_alerts(
+            &engine,
+            &settlement_service,
+            &settlement_repo,
+            &wallet,
+            &room_port,
+            &state,
+            &showdown,
+            RakePolicy::zero(),
+            BatchPayoutSettlementInput {
+                seat_addresses: &seat_addresses,
+                min_confirmations: 1,
+            },
+            poker_domain::TraceId::new(),
+            Some(&alert_sink),
+            Some(&audit_sink),
+        )
+        .await
+        .expect("orchestrated");
+
+        let completed = room_port.completed.lock().expect("lock");
+        assert!(
+            completed.is_empty(),
+            "hand should remain open on failed batch payout"
+        );
+
+        let records = settlement_repo.settlement_records_snapshot();
+        assert!(records
+            .iter()
+            .any(|r| r.settlement_status == "manual_review_required"));
+
+        let alerts = alert_sink.alerts.lock().expect("lock");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "settlement_manual_review_required");
+
+        let events = audit_sink.events.lock().expect("lock");
+        assert!(events.iter().any(|e| e.event_kind == "settlement_batch_receipt"));
+        assert!(events
+            .iter()
+            .any(|e| e.event_kind == "settlement_manual_review_required"));
     }
 
     #[tokio::test]

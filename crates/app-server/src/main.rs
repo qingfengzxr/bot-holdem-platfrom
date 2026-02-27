@@ -13,7 +13,7 @@ mod settlement_orchestrator;
 mod showdown_admin_repo;
 mod showdown_settlement;
 
-use agent_auth::{InMemoryReplayNonceStore, SignedRequestMeta};
+use agent_auth::InMemoryReplayNonceStore;
 use anyhow::Result;
 use audit_event_sink::AuditRoomEventSink;
 use audit_store::{
@@ -22,29 +22,26 @@ use audit_store::{
 };
 use auto_settlement::{
     AppRoomShowdownInputProvider, AutoSettlementLoopConfig, spawn_auto_settlement_loop,
+    spawn_auto_settlement_loop_with_batch,
 };
-use chain_callback_sink::AppChainCallbackSink;
-use chain_watcher::{
-    ObservedTx, TxVerificationInput, build_verification_callback, classify_tx_verification,
-};
-use chrono::Utc;
 use ledger_store::{
     ChainTxRepository, LedgerRepository, NoopChainTxRepository, NoopLedgerRepository,
     PostgresChainTxRepository, PostgresLedgerRepository,
 };
+use jsonrpsee::server::ServerBuilder;
 use observability::init_tracing;
 use ops_http::{InMemoryRoomAdminReadRepository, OpsState, PostgresRoomAdminReadRepository};
 use platform_core::AppConfig;
-use poker_domain::{RequestId, RoomId};
+use poker_domain::RoomId;
 use poker_engine::PokerEngine;
 use room_service_port::AppRoomService;
-use rpc_gateway::{
-    GameGetStateRequest, InMemoryEventBus, RoomBindAddressRequest, RoomBindSessionKeysRequest,
-    RoomReadyRequest, RpcGateway, RpcGatewayLimits,
-};
+use rpc_gateway::{InMemoryEventBus, RpcGateway, RpcGatewayLimits};
 use rpc_reject_audit_sink::AuditRpcRejectSink;
 use rpc_request_signature_verifier::AppRpcRequestSignatureVerifier;
-use settlement::{ReqwestEvmSettlementWalletAdapter, SettlementWalletAdapter};
+use settlement::{
+    BatchSettlementWalletAdapter, ReqwestEvmBatchSettlementWalletAdapter,
+    ReqwestEvmSettlementWalletAdapter, SettlementWalletAdapter,
+};
 use showdown_admin_repo::AppShowdownAdminRepository;
 use sqlx::postgres::PgPoolOptions;
 use std::{env, sync::Arc, time::Duration};
@@ -134,6 +131,26 @@ impl SettlementWalletAdapter for DynWallet {
     }
 }
 
+#[derive(Clone)]
+struct DynBatchWallet(Arc<dyn BatchSettlementWalletAdapter>);
+
+#[async_trait::async_trait]
+impl BatchSettlementWalletAdapter for DynBatchWallet {
+    async fn submit_batch_transfer(
+        &self,
+        request: &settlement::BatchSettlementTransferRequest,
+    ) -> Result<String, String> {
+        self.0.submit_batch_transfer(request).await
+    }
+
+    async fn get_batch_transfer_receipt(
+        &self,
+        tx_hash: &str,
+    ) -> Result<settlement::BatchSettlementTransferReceipt, String> {
+        self.0.get_batch_transfer_receipt(tx_hash).await
+    }
+}
+
 fn build_repo_bundle() -> Result<RepoBundle> {
     let database_url = match env::var("DATABASE_URL") {
         Ok(v) if !v.trim().is_empty() => Some(v),
@@ -141,10 +158,30 @@ fn build_repo_bundle() -> Result<RepoBundle> {
     };
 
     if let Some(url) = database_url {
+        let max_connections = env::var("POSTGRES_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(20);
+        let min_connections = env::var("POSTGRES_MIN_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2)
+            .min(max_connections);
+        let acquire_timeout_ms = env::var("POSTGRES_ACQUIRE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10_000);
         let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(std::time::Duration::from_secs(3))
+            .max_connections(max_connections)
+            .min_connections(min_connections)
+            .acquire_timeout(std::time::Duration::from_millis(acquire_timeout_ms))
             .connect_lazy(&url)?;
+        info!(
+            postgres_max_connections = max_connections,
+            postgres_min_connections = min_connections,
+            postgres_acquire_timeout_ms = acquire_timeout_ms,
+            "postgres pool configured"
+        );
         let audit_pg = Arc::new(PostgresAuditRepository::new(pool.clone()));
         let chain_pg = Arc::new(PostgresChainTxRepository::new(pool.clone()));
         let ledger_pg = Arc::new(PostgresLedgerRepository::new(pool.clone()));
@@ -236,6 +273,21 @@ fn build_settlement_wallet_adapter_from_env() -> Option<Arc<dyn SettlementWallet
     )))
 }
 
+fn build_batch_settlement_wallet_adapter_from_env() -> Option<Arc<dyn BatchSettlementWalletAdapter>>
+{
+    let endpoint = env::var("SETTLEMENT_EVM_RPC_URL").ok()?;
+    let from_address = env::var("SETTLEMENT_FROM_ADDRESS").ok()?;
+    let contract = env::var("SETTLEMENT_BATCH_CONTRACT_ADDRESS").ok()?;
+    if endpoint.trim().is_empty() || from_address.trim().is_empty() || contract.trim().is_empty() {
+        return None;
+    }
+    Some(Arc::new(ReqwestEvmBatchSettlementWalletAdapter::new(
+        endpoint,
+        from_address,
+        contract,
+    )))
+}
+
 async fn spawn_ops_http_server(
     bind_addr: &str,
     router: axum::Router,
@@ -276,8 +328,6 @@ async fn main() -> Result<()> {
     let chain_tx_repo = repo_bundle.chain_tx_repo.clone();
     let room_event_sink = Arc::new(AuditRoomEventSink::new(audit_repo.clone()));
     let room_service = AppRoomService::with_sinks(room_event_sink, chain_tx_repo.clone());
-    let chain_callback_sink = AppChainCallbackSink::new(room_service.clone(), chain_tx_repo)
-        .with_audit_repo(audit_repo.clone());
     let event_bus = Arc::new(InMemoryEventBus::new());
     let rpc_reject_audit_sink = Arc::new(AuditRpcRejectSink::new(repo_bundle.audit_repo.clone()));
     let rpc_request_signature_verifier =
@@ -326,14 +376,59 @@ async fn main() -> Result<()> {
         Some(Arc::new(InMemoryReplayNonceStore::new())),
         Some(rpc_request_signature_verifier),
     )?;
+    let rpc_method_count = rpc_module.method_names().count();
+    let rpc_server = ServerBuilder::default()
+        .build(&config.app.rpc_bind_addr)
+        .await?;
+    let rpc_local_addr = rpc_server.local_addr()?;
+    let rpc_handle = rpc_server.start(rpc_module);
+    info!(rpc_addr = %rpc_local_addr, "json-rpc server started");
     let _settlement_wallet_adapter = build_settlement_wallet_adapter_from_env();
+    let _batch_settlement_wallet_adapter = build_batch_settlement_wallet_adapter_from_env();
+    let settlement_mode = if _batch_settlement_wallet_adapter.is_some() {
+        "batch"
+    } else if _settlement_wallet_adapter.is_some() {
+        "direct"
+    } else {
+        "disabled"
+    };
     info!(
         settlement_wallet_enabled = _settlement_wallet_adapter.is_some(),
+        batch_settlement_wallet_enabled = _batch_settlement_wallet_adapter.is_some(),
+        settlement_mode,
         "settlement wallet adapter configured"
     );
     let (_auto_settlement_shutdown_tx, _auto_settlement_handle) =
         if auto_settlement_enabled_from_env() {
-            if let Some(wallet) = _settlement_wallet_adapter.clone() {
+            if let Some(batch_wallet) = _batch_settlement_wallet_adapter.clone() {
+                let (auto_tx, auto_rx) = oneshot::channel();
+                let room_service_for_loop = room_service.clone();
+                let room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync> =
+                    Arc::new(move || room_service_for_loop.room_ids().map_err(|e| e.to_string()));
+                let settlement_service = Arc::new(settlement::SettlementService::new(
+                    DynLedgerRepo(repo_bundle.ledger_repo.clone()),
+                ));
+                let settlement_repo =
+                    Arc::new(DynSettlementRepo(repo_bundle.settlement_write_repo.clone()));
+                let audit_sink = Arc::new(settlement_audit_sink::AuditSettlementBehaviorSink::new(
+                    repo_bundle.audit_repo.clone(),
+                ));
+                let handle = spawn_auto_settlement_loop_with_batch(
+                    room_service.clone(),
+                    room_ids_provider,
+                    Arc::new(PokerEngine::new()),
+                    settlement_service,
+                    settlement_repo,
+                    Arc::new(DynBatchWallet(batch_wallet)),
+                    showdown_provider.clone(),
+                    AutoSettlementLoopConfig::default(),
+                    auto_rx,
+                    None,
+                    Some(audit_sink),
+                );
+                info!("auto settlement loop enabled (batch payout mode)");
+                (Some(auto_tx), Some(handle))
+            } else if let Some(wallet) = _settlement_wallet_adapter.clone() {
                 let (auto_tx, auto_rx) = oneshot::channel();
                 let room_service_for_loop = room_service.clone();
                 let room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync> =
@@ -359,7 +454,7 @@ async fn main() -> Result<()> {
                     None,
                     Some(audit_sink),
                 );
-                info!("auto settlement loop enabled");
+                info!("auto settlement loop enabled (direct payout mode)");
                 (Some(auto_tx), Some(handle))
             } else {
                 info!("auto settlement loop not started: wallet adapter disabled");
@@ -369,100 +464,9 @@ async fn main() -> Result<()> {
             info!("auto settlement loop disabled by APP_SERVER__AUTO_SETTLEMENT_ENABLED");
             (None, None)
         };
-    let room_id = RoomId::new();
-    let room_handle = room_service.ensure_room(room_id)?;
-    room_handle.join(0).await.map_err(anyhow::Error::msg)?;
-
-    let signed_meta = || SignedRequestMeta {
-        request_id: RequestId::new(),
-        request_nonce: RequestId::new().0.to_string(),
-        request_ts: Utc::now(),
-        request_expiry_ms: 30_000,
-        signature_pubkey_id: "demo-key".to_string(),
-        signature: String::new(),
-    };
-
-    let _ = gateway
-        .handle_bind_address(
-            &room_service,
-            RoomBindAddressRequest {
-                room_id,
-                seat_id: 0,
-                seat_address: "cfx:demo-seat".to_string(),
-                request_meta: signed_meta(),
-            },
-        )
-        .await;
-    let _ = gateway
-        .handle_bind_session_keys(
-            &room_service,
-            RoomBindSessionKeysRequest {
-                room_id,
-                seat_id: 0,
-                seat_address: "cfx:demo-seat".to_string(),
-                card_encrypt_pubkey: "deadbeef".to_string(),
-                request_verify_pubkey: "deadbeef".to_string(),
-                key_algo: "x25519+evm".to_string(),
-                proof_signature: "deadbeef".to_string(),
-                request_meta: signed_meta(),
-            },
-        )
-        .await;
-    let _ = gateway
-        .handle_room_ready(
-            &room_service,
-            RoomReadyRequest {
-                room_id,
-                seat_id: 0,
-                request_meta: signed_meta(),
-            },
-        )
-        .await;
-
-    let state = gateway
-        .handle_get_state(
-            &room_service,
-            GameGetStateRequest {
-                room_id,
-                hand_id: None,
-                seat_id: Some(0),
-            },
-        )
-        .await;
-
-    let tx_input = TxVerificationInput {
-        room_id,
-        hand_id: None,
-        seat_id: Some(0),
-        action_seq: Some(1),
-        tx_hash: "0xdemo".to_string(),
-        expected_to: "cfx:room".to_string(),
-        expected_from: Some("cfx:demo-seat".to_string()),
-        expected_amount: Some(poker_domain::Chips(10)),
-        min_confirmations: 1,
-    };
-    let tx_observed = ObservedTx {
-        tx_hash: "0xdemo".to_string(),
-        from: "cfx:demo-seat".to_string(),
-        to: "cfx:room".to_string(),
-        value: poker_domain::Chips(10),
-        success: true,
-        confirmations: 1,
-    };
-    let tx_result = classify_tx_verification(&tx_input, &tx_observed);
-    let tx_callback = build_verification_callback(&tx_input, &tx_result);
-    chain_watcher::VerificationCallbackSink::on_verification_result(
-        &chain_callback_sink,
-        tx_callback,
-    )
-    .await?;
-
-    info!(
-        request_id = %RequestId::new().0,
-        rpc_methods = rpc_module.method_names().count(),
-        state_ok = state.ok,
-        "demo rpc gateway flow executed"
-    );
+    info!(rpc_methods = rpc_method_count, "rpc module ready");
     info!("app-server bootstrap complete");
+    rpc_handle.stopped().await;
+    info!("json-rpc server stopped");
     Ok(())
 }

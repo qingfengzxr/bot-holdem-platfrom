@@ -9,13 +9,14 @@ use ledger_store::{SettlementPersistenceReadRepository, SettlementPersistenceRep
 use poker_domain::{HandId, HandStatus, RoomId, SeatId, TraceId};
 use poker_engine::{PokerEngine, ShowdownInput};
 use rs_poker::core::{Card, FlatHand};
-use settlement::{RakePolicy, SettlementService, SettlementWalletAdapter};
+use settlement::{BatchSettlementWalletAdapter, RakePolicy, SettlementService, SettlementWalletAdapter};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::room_service_port::AppRoomService;
 use crate::settlement_orchestrator::{
-    DirectPayoutSettlementInput, SettlementAlertSink, SettlementAuditSink, SettlementLifecyclePort,
+    BatchPayoutSettlementInput, DirectPayoutSettlementInput, SettlementAlertSink,
+    SettlementAuditSink, SettlementLifecyclePort, run_showdown_settlement_with_batch_payouts_and_alerts,
     run_showdown_settlement_with_direct_payouts_and_alerts,
 };
 
@@ -389,6 +390,86 @@ where
     Ok(AutoSettlementOutcome::Settled)
 }
 
+pub async fn try_auto_settle_showdown_room_with_batch<L, RP, SP, SR, W>(
+    room_id: RoomId,
+    engine: &PokerEngine,
+    settlement_service: &SettlementService<L>,
+    settlement_repo: &SR,
+    wallet: &W,
+    room_port: &RP,
+    showdown_provider: &SP,
+    rake_policy: RakePolicy,
+    min_confirmations: u64,
+    trace_id: TraceId,
+    alert_sink: Option<&dyn SettlementAlertSink>,
+    audit_sink: Option<&dyn SettlementAuditSink>,
+) -> Result<AutoSettlementOutcome, String>
+where
+    L: ledger_store::LedgerRepository,
+    RP: AutoSettlementRoomPort,
+    SR: ledger_store::SettlementPersistenceRepository,
+    W: BatchSettlementWalletAdapter,
+    SP: ShowdownInputProvider,
+{
+    let Some(state) = room_port.get_engine_state(room_id).await? else {
+        return Ok(AutoSettlementOutcome::NoActiveHand);
+    };
+    if state.snapshot.status != HandStatus::Showdown {
+        return Ok(AutoSettlementOutcome::NotShowdown);
+    }
+
+    let Some(showdown_input) = showdown_provider
+        .get_showdown_input(room_id, state.snapshot.hand_id)
+        .await?
+    else {
+        return Ok(AutoSettlementOutcome::WaitingForShowdownInput);
+    };
+    let seat_addresses = showdown_provider
+        .get_settlement_seat_addresses(room_id, state.snapshot.hand_id)
+        .await?;
+    if seat_addresses.is_empty() {
+        return Ok(AutoSettlementOutcome::WaitingForSeatAddresses);
+    }
+
+    struct RoomLifecycleAdapter<'a, RP> {
+        inner: &'a RP,
+        room_id: RoomId,
+    }
+
+    #[async_trait]
+    impl<RP: AutoSettlementRoomPort> SettlementLifecyclePort for RoomLifecycleAdapter<'_, RP> {
+        async fn complete_settlement(&self, hand_id: HandId) -> Result<(), String> {
+            self.inner.complete_settlement(self.room_id, hand_id).await
+        }
+    }
+
+    let lifecycle = RoomLifecycleAdapter {
+        inner: room_port,
+        room_id,
+    };
+
+    let _ = run_showdown_settlement_with_batch_payouts_and_alerts(
+        engine,
+        settlement_service,
+        settlement_repo,
+        wallet,
+        &lifecycle,
+        &state,
+        &showdown_input,
+        rake_policy,
+        BatchPayoutSettlementInput {
+            seat_addresses: &seat_addresses,
+            min_confirmations,
+        },
+        trace_id,
+        alert_sink,
+        audit_sink,
+    )
+    .await?;
+
+    Ok(AutoSettlementOutcome::Settled)
+}
+
 pub fn spawn_auto_settlement_loop<L, SP, SR, W>(
     room_service: AppRoomService,
     room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync>,
@@ -426,6 +507,65 @@ where
                     };
                     for room_id in room_ids {
                         if let Err(err) = try_auto_settle_showdown_room(
+                            room_id,
+                            &engine,
+                            &settlement_service,
+                            &*settlement_repo,
+                            &*wallet,
+                            &room_service,
+                            &*showdown_provider,
+                            cfg.rake_policy,
+                            cfg.min_confirmations,
+                            TraceId::new(),
+                            alert_sink.as_deref(),
+                            audit_sink.as_deref(),
+                        ).await {
+                            warn!(room_id = %room_id.0, error = %err, "auto settlement attempt failed");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub fn spawn_auto_settlement_loop_with_batch<L, SP, SR, W>(
+    room_service: AppRoomService,
+    room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync>,
+    engine: Arc<PokerEngine>,
+    settlement_service: Arc<SettlementService<L>>,
+    settlement_repo: Arc<SR>,
+    wallet: Arc<W>,
+    showdown_provider: Arc<SP>,
+    cfg: AutoSettlementLoopConfig,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    alert_sink: Option<Arc<dyn SettlementAlertSink>>,
+    audit_sink: Option<Arc<dyn SettlementAuditSink>>,
+) -> tokio::task::JoinHandle<()>
+where
+    L: ledger_store::LedgerRepository + Send + Sync + 'static,
+    SP: ShowdownInputProvider + 'static,
+    SR: ledger_store::SettlementPersistenceRepository + Send + Sync + 'static,
+    W: BatchSettlementWalletAdapter + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cfg.poll_interval);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("auto settlement loop shutdown");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let room_ids = match room_ids_provider() {
+                        Ok(ids) => ids,
+                        Err(err) => {
+                            warn!(error = %err, "auto settlement room id provider failed");
+                            continue;
+                        }
+                    };
+                    for room_id in room_ids {
+                        if let Err(err) = try_auto_settle_showdown_room_with_batch(
                             room_id,
                             &engine,
                             &settlement_service,

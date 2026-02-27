@@ -79,6 +79,22 @@ pub struct GameGetLegalActionsRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameGetPrivatePayloadsRequest {
+    pub room_id: RoomId,
+    pub seat_id: SeatId,
+    pub hand_id: Option<HandId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivatePayloadEvent {
+    pub room_id: RoomId,
+    pub hand_id: HandId,
+    pub seat_id: SeatId,
+    pub event_name: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomBindAddressRequest {
     pub room_id: RoomId,
     pub seat_id: SeatId,
@@ -96,6 +112,11 @@ pub struct RoomReadyRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomListRequest {
     pub include_inactive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoomCreateRequest {
+    pub room_id: Option<RoomId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +418,10 @@ pub struct RpcContext<S, E> {
 
 #[async_trait]
 pub trait RoomServicePort: Send + Sync {
+    async fn create_room(
+        &self,
+        request: RoomCreateRequest,
+    ) -> Result<RoomSummary, RpcGatewayError>;
     async fn list_rooms(
         &self,
         request: RoomListRequest,
@@ -416,6 +441,10 @@ pub trait RoomServicePort: Send + Sync {
         room_id: RoomId,
         seat_id: SeatId,
     ) -> Result<Vec<LegalAction>, RpcGatewayError>;
+    async fn get_private_payloads(
+        &self,
+        request: GameGetPrivatePayloadsRequest,
+    ) -> Result<Vec<PrivatePayloadEvent>, RpcGatewayError>;
     async fn act(&self, request: GameActRequest) -> Result<(), RpcGatewayError>;
 }
 
@@ -844,6 +873,7 @@ impl RpcGateway {
         vec![
             "auth.register_agent",
             "auth.get_challenge",
+            "room.create",
             "room.list",
             "room.join",
             "room.ready",
@@ -851,6 +881,7 @@ impl RpcGateway {
             "room.bind_session_keys",
             "game.get_state",
             "game.get_legal_actions",
+            "game.get_private_payloads",
             "game.act",
             "game.get_hand_history",
             "game.get_ledger",
@@ -868,7 +899,11 @@ impl RpcGateway {
 
     pub fn method_policy(&self, method: &str) -> MethodPolicy {
         match method {
-            "room.list" | "game.get_state" | "game.get_legal_actions" => MethodPolicy {
+            "room.create"
+            | "room.list"
+            | "game.get_state"
+            | "game.get_legal_actions"
+            | "game.get_private_payloads" => MethodPolicy {
                 scope: MethodScope::Agent,
                 requires_signature: false,
             },
@@ -1015,6 +1050,17 @@ impl RpcGateway {
         match room_service.list_rooms(request).await {
             Ok(rooms) => RpcResult::ok(rooms),
             Err(err) => RpcResult::err(ErrorCode::RoomListFailed, err.to_string()),
+        }
+    }
+
+    pub async fn handle_room_create<S: RoomServicePort>(
+        &self,
+        room_service: &S,
+        request: RoomCreateRequest,
+    ) -> RpcResult<RoomSummary> {
+        match room_service.create_room(request).await {
+            Ok(room) => RpcResult::ok(room),
+            Err(err) => RpcResult::err(ErrorCode::RoomCreateFailed, err.to_string()),
         }
     }
 
@@ -1188,6 +1234,17 @@ impl RpcGateway {
         }
     }
 
+    pub async fn handle_get_private_payloads<S: RoomServicePort>(
+        &self,
+        room_service: &S,
+        request: GameGetPrivatePayloadsRequest,
+    ) -> RpcResult<Vec<PrivatePayloadEvent>> {
+        match room_service.get_private_payloads(request).await {
+            Ok(payloads) => RpcResult::ok(payloads),
+            Err(err) => RpcResult::err(ErrorCode::GameGetStateFailed, err.to_string()),
+        }
+    }
+
     pub async fn handle_game_act<S: RoomServicePort>(
         &self,
         room_service: &S,
@@ -1281,6 +1338,19 @@ impl RpcGateway {
         let mut module = RpcModule::new(room_service);
 
         module
+            .register_async_method("room.create", |params, ctx, _| async move {
+                let req: RoomCreateRequest = match params.parse() {
+                    Ok(v) => v,
+                    Err(_) => RoomCreateRequest::default(),
+                };
+                let gateway = RpcGateway::new();
+                Ok::<_, ErrorObjectOwned>(
+                    gateway.handle_room_create(ctx.as_ref().as_ref(), req).await,
+                )
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
+
+        module
             .register_async_method("room.list", |params, ctx, _| async move {
                 let req: RoomListRequest = match params.parse() {
                     Ok(v) => v,
@@ -1344,6 +1414,18 @@ impl RpcGateway {
                 let req: GameActRequest = params.parse()?;
                 let gateway = RpcGateway::new();
                 Ok::<_, ErrorObjectOwned>(gateway.handle_game_act(ctx.as_ref().as_ref(), req).await)
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
+
+        module
+            .register_async_method("game.get_private_payloads", |params, ctx, _| async move {
+                let req: GameGetPrivatePayloadsRequest = params.parse()?;
+                let gateway = RpcGateway::new();
+                Ok::<_, ErrorObjectOwned>(
+                    gateway
+                        .handle_get_private_payloads(ctx.as_ref().as_ref(), req)
+                        .await,
+                )
             })
             .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
 
@@ -1414,6 +1496,30 @@ impl RpcGateway {
             request_signature_verifier,
         });
         let mut module = RpcModule::new(ctx);
+
+        module
+            .register_async_method("room.create", |params, ctx, ext| async move {
+                let gateway = RpcGateway::new();
+                let _permit = match gateway.try_acquire_ctx_connection_permit(ctx.as_ref(), &ext) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok::<_, ErrorObjectOwned>(RpcResult::err(
+                            ErrorCode::Forbidden,
+                            err.to_string(),
+                        ));
+                    }
+                };
+                let req: RoomCreateRequest = match params.parse() {
+                    Ok(v) => v,
+                    Err(_) => RoomCreateRequest::default(),
+                };
+                Ok::<_, ErrorObjectOwned>(
+                    gateway
+                        .handle_room_create(ctx.as_ref().room_service.as_ref(), req)
+                        .await,
+                )
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
 
         module
             .register_async_method("room.list", |params, ctx, ext| async move {
@@ -1586,6 +1692,27 @@ impl RpcGateway {
                             ctx.as_ref().replay_nonce_store.as_deref(),
                             ctx.as_ref().request_signature_verifier.as_deref(),
                         )
+                        .await,
+                )
+            })
+            .map_err(|e| RpcGatewayError::JsonRpcRegistration(e.to_string()))?;
+
+        module
+            .register_async_method("game.get_private_payloads", |params, ctx, ext| async move {
+                let gateway = RpcGateway::new();
+                let _permit = match gateway.try_acquire_ctx_connection_permit(ctx.as_ref(), &ext) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok::<_, ErrorObjectOwned>(RpcResult::err(
+                            ErrorCode::Forbidden,
+                            err.to_string(),
+                        ));
+                    }
+                };
+                let req: GameGetPrivatePayloadsRequest = params.parse()?;
+                Ok::<_, ErrorObjectOwned>(
+                    gateway
+                        .handle_get_private_payloads(ctx.as_ref().room_service.as_ref(), req)
                         .await,
                 )
             })
@@ -1851,6 +1978,16 @@ mod tests {
 
     #[async_trait]
     impl RoomServicePort for DummyRoomService {
+        async fn create_room(
+            &self,
+            request: RoomCreateRequest,
+        ) -> Result<RoomSummary, RpcGatewayError> {
+            Ok(RoomSummary {
+                room_id: request.room_id.unwrap_or_else(RoomId::new),
+                status: "active".to_string(),
+            })
+        }
+
         async fn list_rooms(
             &self,
             _request: RoomListRequest,
@@ -1888,6 +2025,13 @@ mod tests {
             _room_id: RoomId,
             _seat_id: SeatId,
         ) -> Result<Vec<LegalAction>, RpcGatewayError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_private_payloads(
+            &self,
+            _request: GameGetPrivatePayloadsRequest,
+        ) -> Result<Vec<PrivatePayloadEvent>, RpcGatewayError> {
             Ok(Vec::new())
         }
 
@@ -2528,5 +2672,18 @@ mod tests {
             .expect("handler result");
         assert_eq!(result, 123);
         assert_eq!(limiter.active_for("conn-1"), 0);
+    }
+
+    #[tokio::test]
+    async fn handle_room_create_returns_created_room() {
+        let gw = RpcGateway::new();
+        let room_id = RoomId::new();
+        let resp = gw
+            .handle_room_create(&DummyRoomService, RoomCreateRequest { room_id: Some(room_id) })
+            .await;
+        assert!(resp.ok, "{resp:?}");
+        let data = resp.data.expect("room");
+        assert_eq!(data.room_id, room_id);
+        assert_eq!(data.status, "active");
     }
 }

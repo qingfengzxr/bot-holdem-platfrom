@@ -3,7 +3,7 @@ use std::sync::Arc;
 use audit_store::{AuditRepository, BehaviorEventRecord, OutboxEventRecord};
 use chrono::Utc;
 use serde_json::to_value;
-use table_service::{RoomBehaviorEvent, RoomEventSink};
+use table_service::{RoomBehaviorEvent, RoomEventSink, SeatPrivateEvent};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -123,6 +123,37 @@ impl<R: AuditRepository + ?Sized + 'static> RoomEventSink for AuditRoomEventSink
             };
             if let Err(err) = repo.insert_behavior_event(&record).await {
                 tracing::warn!(error = %err, "insert behavior event failed");
+            }
+        });
+        Ok(())
+    }
+
+    fn append_private_events(&self, events: &[SeatPrivateEvent]) -> Result<(), String> {
+        let repo = self.repo.clone();
+        let events_vec = events.to_vec();
+        tokio::spawn(async move {
+            for event in &events_vec {
+                let now = Utc::now();
+                let record = OutboxEventRecord {
+                    outbox_event_id: Uuid::now_v7().to_string(),
+                    topic: "seat.events".to_string(),
+                    partition_key: format!("{}:{}", event.room_id.0, event.seat_id),
+                    payload_json: serde_json::json!({
+                        "room_id": event.room_id,
+                        "hand_id": event.hand_id,
+                        "seat_id": event.seat_id,
+                        "event_name": event.event_name,
+                        "payload": event.payload,
+                    }),
+                    status: "pending".to_string(),
+                    attempts: 0,
+                    available_at: now,
+                    delivered_at: None,
+                    created_at: now,
+                };
+                if let Err(err) = repo.insert_outbox_event(&record).await {
+                    tracing::warn!(error = %err, "insert seat private outbox event failed");
+                }
             }
         });
         Ok(())

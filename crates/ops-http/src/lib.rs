@@ -333,19 +333,19 @@ pub fn build_router_with_state(state: OpsState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/admin/rooms/:id", get(admin_room))
-        .route("/admin/hands/:id/replay", get(admin_hand_replay))
-        .route("/admin/settlements/hand/:id", get(admin_settlement_hand))
+        .route("/admin/rooms/{id}", get(admin_room))
+        .route("/admin/hands/{id}/replay", get(admin_hand_replay))
+        .route("/admin/settlements/hand/{id}", get(admin_settlement_hand))
         .route(
-            "/admin/settlements/hand/:id/showdown-input",
+            "/admin/settlements/hand/{id}/showdown-input",
             post(admin_upsert_showdown_input),
         )
         .route(
-            "/admin/settlements/tx/:id/manual-review",
+            "/admin/settlements/tx/{id}/manual-review",
             post(admin_mark_settlement_manual_review),
         )
-        .route("/admin/audit/request/:id", get(admin_audit_request))
-        .route("/admin/audit/tx/:id", get(admin_audit_tx))
+        .route("/admin/audit/request/{id}", get(admin_audit_request))
+        .route("/admin/audit/tx/{id}", get(admin_audit_tx))
         .with_state(state)
 }
 

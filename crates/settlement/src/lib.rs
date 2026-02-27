@@ -2,6 +2,7 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
 use chrono::Utc;
+use ethabi::{Function, Param, ParamType, StateMutability, Token};
 use ledger_store::{
     LedgerDirection, LedgerEntryInsert, LedgerRepository, LedgerStoreError,
     RoomSigningKeyReadRepository, SettlementPersistenceRepository, SettlementRecordStatusUpdate,
@@ -9,7 +10,9 @@ use ledger_store::{
 use poker_domain::{Chips, HandId, MoneyError, RoomId, SeatId, TraceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::info;
 
@@ -25,6 +28,8 @@ pub enum SettlementError {
     WalletAdapter(String),
     #[error("key decrypt error: {0}")]
     KeyDecrypt(String),
+    #[error("invalid rake policy: {0}")]
+    InvalidRakePolicy(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,11 +133,61 @@ impl RakePolicy {
     pub fn zero() -> Self {
         Self { rake_bps: 0 }
     }
+
+    #[must_use]
+    pub fn three_percent() -> Self {
+        Self { rake_bps: 300 }
+    }
+
+    pub fn rake_amount_for(&self, pot_total: Chips) -> Result<Chips, SettlementError> {
+        if self.rake_bps > 10_000 {
+            return Err(SettlementError::InvalidRakePolicy(format!(
+                "rake_bps={} exceeds 10000",
+                self.rake_bps
+            )));
+        }
+        // Chain unit is integer chips, so rake always rounds down.
+        Ok(Chips(
+            pot_total
+                .as_u128()
+                .saturating_mul(self.rake_bps as u128)
+                / 10_000,
+        ))
+    }
 }
 
 #[derive(Debug)]
 pub struct SettlementService<L> {
     ledger_repo: L,
+}
+
+pub struct RoomSigningKeyHandle {
+    address: String,
+    key_version: i32,
+    private_key_bytes: Vec<u8>,
+}
+
+impl RoomSigningKeyHandle {
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    #[must_use]
+    pub fn key_version(&self) -> i32 {
+        self.key_version
+    }
+
+    #[must_use]
+    pub fn has_private_key_material(&self) -> bool {
+        !self.private_key_bytes.is_empty()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn private_key_bytes(&self) -> &[u8] {
+        &self.private_key_bytes
+    }
 }
 
 #[async_trait]
@@ -158,7 +213,7 @@ pub trait BatchSettlementWalletAdapter: Send + Sync {
     ) -> Result<BatchSettlementTransferReceipt, String>;
 }
 
-pub fn decrypt_room_signing_key_aes256_gcm(
+fn decrypt_room_signing_key_aes256_gcm(
     record: &EncryptedRoomSigningKey,
     kek: &[u8; 32],
 ) -> Result<Vec<u8>, SettlementError> {
@@ -186,7 +241,7 @@ pub fn decrypt_room_signing_key_aes256_gcm(
         .map_err(|e| SettlementError::KeyDecrypt(e.to_string()))
 }
 
-pub fn decrypt_room_signing_key_record_aes256_gcm(
+fn decrypt_room_signing_key_record_aes256_gcm(
     record: &ledger_store::RoomSigningKeyRecord,
     kek: &[u8; 32],
 ) -> Result<Vec<u8>, SettlementError> {
@@ -205,7 +260,7 @@ pub fn decrypt_room_signing_key_record_aes256_gcm(
     )
 }
 
-pub async fn load_and_decrypt_active_room_signing_key<R, F>(
+async fn load_and_decrypt_active_room_signing_key<R, F>(
     repo: &R,
     room_id: RoomId,
     mut resolve_kek: F,
@@ -257,6 +312,7 @@ pub struct ReqwestEvmSettlementWalletAdapter {
     endpoint: String,
     from_address: String,
     client: reqwest::Client,
+    next_nonce: Arc<Mutex<Option<u64>>>,
 }
 
 impl ReqwestEvmSettlementWalletAdapter {
@@ -266,6 +322,7 @@ impl ReqwestEvmSettlementWalletAdapter {
             endpoint: endpoint.into(),
             from_address: from_address.into(),
             client: reqwest::Client::new(),
+            next_nonce: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -293,6 +350,165 @@ impl ReqwestEvmSettlementWalletAdapter {
         }
         payload.result.ok_or_else(|| "missing result".to_string())
     }
+
+    async fn reserve_nonce(&self) -> Result<u64, String> {
+        let pending_hex: String = self
+            .rpc_call(
+                "eth_getTransactionCount",
+                serde_json::json!([self.from_address, "pending"]),
+            )
+            .await?;
+        let chain_pending = parse_hex_u64(&pending_hex)?;
+
+        let mut guard = self
+            .next_nonce
+            .lock()
+            .map_err(|_| "nonce lock poisoned".to_string())?;
+        let nonce = match *guard {
+            Some(local_next) => local_next.max(chain_pending),
+            None => chain_pending,
+        };
+        *guard = Some(nonce.saturating_add(1));
+        Ok(nonce)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReqwestEvmBatchSettlementWalletAdapter {
+    endpoint: String,
+    from_address: String,
+    contract_address: String,
+    client: reqwest::Client,
+    next_nonce: Arc<Mutex<Option<u64>>>,
+    tx_transfer_count: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl ReqwestEvmBatchSettlementWalletAdapter {
+    #[must_use]
+    pub fn new(
+        endpoint: impl Into<String>,
+        from_address: impl Into<String>,
+        contract_address: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            from_address: from_address.into(),
+            contract_address: contract_address.into(),
+            client: reqwest::Client::new(),
+            next_nonce: Arc::new(Mutex::new(None)),
+            tx_transfer_count: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn rpc_call<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<T, String> {
+        let body = serde_json::json!({
+            "jsonrpc":"2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let resp = self
+            .client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let payload: JsonRpcResponse<T> = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(err) = payload.error {
+            return Err(format!("rpc code={} message={}", err.code, err.message));
+        }
+        payload.result.ok_or_else(|| "missing result".to_string())
+    }
+
+    async fn reserve_nonce(&self) -> Result<u64, String> {
+        let pending_hex: String = self
+            .rpc_call(
+                "eth_getTransactionCount",
+                serde_json::json!([self.from_address, "pending"]),
+            )
+            .await?;
+        let chain_pending = parse_hex_u64(&pending_hex)?;
+        let mut guard = self
+            .next_nonce
+            .lock()
+            .map_err(|_| "nonce lock poisoned".to_string())?;
+        let nonce = match *guard {
+            Some(local_next) => local_next.max(chain_pending),
+            None => chain_pending,
+        };
+        *guard = Some(nonce.saturating_add(1));
+        Ok(nonce)
+    }
+
+    fn encode_batch_settlement_call(
+        &self,
+        request: &BatchSettlementTransferRequest,
+    ) -> Result<String, String> {
+        let recipients: Vec<Token> = request
+            .transfers
+            .iter()
+            .map(|t| {
+                t.to_address
+                    .parse()
+                    .map(Token::Address)
+                    .map_err(|e| format!("invalid recipient address {}: {e}", t.to_address))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let amounts: Vec<Token> = request
+            .transfers
+            .iter()
+            .map(|t| Token::Uint(ethabi::ethereum_types::U256::from(t.amount.as_u128())))
+            .collect();
+        let settlement_id = build_settlement_batch_id(request.room_id, request.hand_id);
+
+        #[allow(deprecated)]
+        let func = Function {
+            name: "settleBatch".to_string(),
+            inputs: vec![
+                Param {
+                    name: "recipients".to_string(),
+                    kind: ParamType::Array(Box::new(ParamType::Address)),
+                    internal_type: None,
+                },
+                Param {
+                    name: "amounts".to_string(),
+                    kind: ParamType::Array(Box::new(ParamType::Uint(256))),
+                    internal_type: None,
+                },
+                Param {
+                    name: "settlementId".to_string(),
+                    kind: ParamType::FixedBytes(32),
+                    internal_type: None,
+                },
+            ],
+            outputs: vec![],
+            constant: None,
+            state_mutability: StateMutability::Payable,
+        };
+        let data = func
+            .encode_input(&[
+                Token::Array(recipients),
+                Token::Array(amounts),
+                Token::FixedBytes(settlement_id.to_vec()),
+            ])
+            .map_err(|e| format!("abi encode failed: {e}"))?;
+        Ok(format!("0x{}", hex::encode(data)))
+    }
+}
+
+fn build_settlement_batch_id(room_id: RoomId, hand_id: HandId) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(room_id.0.as_bytes());
+    hasher.update(hand_id.0.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 impl<L> SettlementService<L>
@@ -302,6 +518,45 @@ where
     #[must_use]
     pub fn new(ledger_repo: L) -> Self {
         Self { ledger_repo }
+    }
+
+    pub async fn load_room_signing_key_for_settlement<R, F>(
+        &self,
+        repo: &R,
+        room_id: RoomId,
+        resolve_kek: F,
+        trace_id: TraceId,
+    ) -> Result<Option<RoomSigningKeyHandle>, SettlementError>
+    where
+        R: RoomSigningKeyReadRepository,
+        F: FnMut(&str) -> Option<[u8; 32]>,
+    {
+        let Some(record) = repo
+            .get_active_room_signing_key(room_id)
+            .await
+            .map_err(SettlementError::Ledger)?
+        else {
+            return Ok(None);
+        };
+        let encrypted_len = record.encrypted_private_key.len();
+        let key_version = record.key_version;
+        let address = record.address.clone();
+        let private_key_bytes = load_and_decrypt_active_room_signing_key(repo, room_id, resolve_kek)
+            .await?
+            .ok_or_else(|| SettlementError::KeyDecrypt("active key disappeared".to_string()))?;
+        info!(
+            room_id = %room_id.0,
+            address = %address,
+            key_version,
+            encrypted_len,
+            trace_id = ?trace_id,
+            "room signing key loaded for settlement service"
+        );
+        Ok(Some(RoomSigningKeyHandle {
+            address,
+            key_version,
+            private_key_bytes,
+        }))
     }
 
     pub fn build_plan_from_winners(
@@ -324,12 +579,7 @@ where
             });
         }
 
-        let rake_amount = Chips(
-            pot_total
-                .as_u128()
-                .saturating_mul(rake_policy.rake_bps as u128)
-                / 10_000,
-        );
+        let rake_amount = rake_policy.rake_amount_for(pot_total)?;
         let distributable = pot_total.checked_sub(rake_amount)?;
         let winner_count = winners.len() as u128;
         let base = Chips(distributable.as_u128() / winner_count);
@@ -413,12 +663,7 @@ where
             });
         }
 
-        let rake_amount = Chips(
-            gross_total
-                .as_u128()
-                .saturating_mul(rake_policy.rake_bps as u128)
-                / 10_000,
-        );
+        let rake_amount = rake_policy.rake_amount_for(gross_total)?;
         let distributable = gross_total.checked_sub(rake_amount)?;
         let payouts = apportion_by_weight(&gross_payouts, distributable)?;
 
@@ -617,12 +862,14 @@ where
 impl SettlementWalletAdapter for ReqwestEvmSettlementWalletAdapter {
     async fn submit_transfer(&self, request: &SettlementTransferRequest) -> Result<String, String> {
         let value_hex = format!("0x{:x}", request.amount.as_u128());
+        let nonce_hex = format!("0x{:x}", self.reserve_nonce().await?);
         self.rpc_call(
             "eth_sendTransaction",
             serde_json::json!([{
                 "from": self.from_address,
                 "to": request.to_address,
                 "value": value_hex,
+                "nonce": nonce_hex,
             }]),
         )
         .await
@@ -670,6 +917,100 @@ impl SettlementWalletAdapter for ReqwestEvmSettlementWalletAdapter {
                 SettlementTxStatus::Failed
             },
             confirmations,
+        })
+    }
+}
+
+#[async_trait]
+impl BatchSettlementWalletAdapter for ReqwestEvmBatchSettlementWalletAdapter {
+    async fn submit_batch_transfer(
+        &self,
+        request: &BatchSettlementTransferRequest,
+    ) -> Result<String, String> {
+        if request.transfers.is_empty() {
+            return Err("batch transfer list cannot be empty".to_string());
+        }
+        let total_value = request
+            .transfers
+            .iter()
+            .try_fold(Chips::ZERO, |acc, t| acc.checked_add(t.amount))
+            .map_err(|e| format!("batch payout total overflow: {e}"))?;
+        let data = self.encode_batch_settlement_call(request)?;
+        let nonce_hex = format!("0x{:x}", self.reserve_nonce().await?);
+        let value_hex = format!("0x{:x}", total_value.as_u128());
+        let tx_hash: String = self
+            .rpc_call(
+                "eth_sendTransaction",
+                serde_json::json!([{
+                    "from": self.from_address,
+                    "to": self.contract_address,
+                    "value": value_hex,
+                    "data": data,
+                    "nonce": nonce_hex,
+                }]),
+            )
+            .await?;
+        self.tx_transfer_count
+            .lock()
+            .map_err(|_| "tx_transfer_count lock poisoned".to_string())?
+            .insert(tx_hash.clone(), request.transfers.len());
+        Ok(tx_hash)
+    }
+
+    async fn get_batch_transfer_receipt(
+        &self,
+        tx_hash: &str,
+    ) -> Result<BatchSettlementTransferReceipt, String> {
+        let receipt: Option<EthTransactionReceipt> = self
+            .rpc_call("eth_getTransactionReceipt", serde_json::json!([tx_hash]))
+            .await?;
+        let Some(receipt) = receipt else {
+            return Ok(BatchSettlementTransferReceipt {
+                tx_hash: tx_hash.to_string(),
+                status: SettlementTxStatus::Pending,
+                confirmations: 0,
+                applied_count: self
+                    .tx_transfer_count
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(tx_hash).copied())
+                    .unwrap_or(0),
+            });
+        };
+
+        let latest_block_hex: String = self
+            .rpc_call("eth_blockNumber", serde_json::json!([]))
+            .await?;
+        let latest_block = parse_hex_u64(&latest_block_hex)?;
+        let receipt_block = receipt
+            .block_number
+            .as_deref()
+            .map(parse_hex_u64)
+            .transpose()?
+            .unwrap_or(0);
+        let confirmations = latest_block.saturating_sub(receipt_block).saturating_add(1);
+        let success = receipt
+            .status
+            .as_deref()
+            .map(parse_hex_u64)
+            .transpose()?
+            .map(|v| v == 1)
+            .unwrap_or(false);
+        let applied_count = self
+            .tx_transfer_count
+            .lock()
+            .ok()
+            .and_then(|m| m.get(tx_hash).copied())
+            .unwrap_or(0);
+        Ok(BatchSettlementTransferReceipt {
+            tx_hash: tx_hash.to_string(),
+            status: if success {
+                SettlementTxStatus::Confirmed
+            } else {
+                SettlementTxStatus::Failed
+            },
+            confirmations,
+            applied_count,
         })
     }
 }
@@ -900,6 +1241,28 @@ mod tests {
     }
 
     #[test]
+    fn rake_rounds_down_to_chain_unit() {
+        let policy = RakePolicy::three_percent();
+        assert_eq!(policy.rake_amount_for(Chips(33)).expect("rake"), Chips(0));
+        assert_eq!(policy.rake_amount_for(Chips(34)).expect("rake"), Chips(1));
+    }
+
+    #[test]
+    fn build_plan_rejects_invalid_rake_policy() {
+        let svc = SettlementService::new(NoopLedgerRepository);
+        let err = svc
+            .build_plan_from_winners(
+                RoomId::new(),
+                HandId::new(),
+                Chips(100),
+                &[0, 1],
+                RakePolicy { rake_bps: 10_001 },
+            )
+            .expect_err("invalid rake policy should be rejected");
+        assert!(err.to_string().contains("invalid rake policy"));
+    }
+
+    #[test]
     fn build_plan_from_pot_awards_handles_main_and_side_pot() {
         let svc = SettlementService::new(NoopLedgerRepository);
         let plan = svc
@@ -992,6 +1355,40 @@ mod tests {
             plan.payouts
                 .iter()
                 .any(|p| p.seat_id == 1 && p.amount < Chips(50))
+        );
+    }
+
+    #[test]
+    fn pot_award_rake_rounding_and_remainder_apportion_is_deterministic() {
+        let svc = SettlementService::new(NoopLedgerRepository);
+        let plan = svc
+            .build_plan_from_pot_awards(
+                RoomId::new(),
+                HandId::new(),
+                &[PotAwardInput {
+                    amount: Chips(34),
+                    eligible_seats: vec![1, 0],
+                    winner_seats: vec![1, 0],
+                }],
+                RakePolicy::three_percent(),
+            )
+            .expect("plan");
+        // 34 * 3% = 1.02 => floor 1, distributable = 33.
+        assert_eq!(plan.rake_amount, Chips(1));
+        assert_eq!(plan.payout_total().expect("sum"), Chips(33));
+        // Equal weights with odd remainder should deterministically grant +1 to smaller seat_id.
+        assert_eq!(
+            plan.payouts,
+            vec![
+                SettlementPayout {
+                    seat_id: 0,
+                    amount: Chips(17)
+                },
+                SettlementPayout {
+                    seat_id: 1,
+                    amount: Chips(16)
+                }
+            ]
         );
     }
 
@@ -1225,7 +1622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_and_decrypt_active_room_signing_key_reads_from_repo() {
+    async fn settlement_service_loads_and_decrypts_active_room_key() {
         let room_id = RoomId::new();
         let kek = [3_u8; 32];
         let nonce = [4_u8; 12];
@@ -1259,13 +1656,20 @@ mod tests {
         })
         .expect("insert");
 
-        let decrypted = load_and_decrypt_active_room_signing_key(&repo, room_id, |kek_id| {
-            (kek_id == "kek-1").then_some(kek)
-        })
-        .await
-        .expect("decrypt")
-        .expect("active key");
-        assert_eq!(decrypted, plaintext);
+        let svc = SettlementService::new(InMemoryLedgerRepository::new());
+        let handle = svc
+            .load_room_signing_key_for_settlement(
+                &repo,
+                room_id,
+                |kek_id| (kek_id == "kek-1").then_some(kek),
+                TraceId::new(),
+            )
+            .await
+            .expect("decrypt")
+            .expect("active key");
+        assert_eq!(handle.address(), "0xroom");
+        assert_eq!(handle.key_version(), 1);
+        assert_eq!(handle.private_key_bytes(), plaintext.as_slice());
     }
 
     #[tokio::test]
@@ -1356,6 +1760,49 @@ mod tests {
     fn parse_hex_u64_parses_evm_quantities() {
         assert_eq!(parse_hex_u64("0x0").expect("zero"), 0);
         assert_eq!(parse_hex_u64("0x10").expect("sixteen"), 16);
+    }
+
+    #[test]
+    fn settlement_batch_id_is_stable_for_same_room_and_hand() {
+        let room_id = RoomId::new();
+        let hand_id = HandId::new();
+        let a = build_settlement_batch_id(room_id, hand_id);
+        let b = build_settlement_batch_id(room_id, hand_id);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn batch_settlement_adapter_encodes_contract_call_data() {
+        let adapter = ReqwestEvmBatchSettlementWalletAdapter::new(
+            "http://127.0.0.1:8545",
+            "0x0000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000002",
+        );
+        let request = BatchSettlementTransferRequest {
+            room_id: RoomId::new(),
+            hand_id: HandId::new(),
+            transfers: vec![
+                SettlementTransferRequest {
+                    room_id: RoomId::new(),
+                    hand_id: HandId::new(),
+                    to_seat_id: 1,
+                    to_address: "0x0000000000000000000000000000000000000011".to_string(),
+                    amount: Chips(7),
+                },
+                SettlementTransferRequest {
+                    room_id: RoomId::new(),
+                    hand_id: HandId::new(),
+                    to_seat_id: 2,
+                    to_address: "0x0000000000000000000000000000000000000022".to_string(),
+                    amount: Chips(9),
+                },
+            ],
+        };
+        let data = adapter
+            .encode_batch_settlement_call(&request)
+            .expect("encode");
+        assert!(data.starts_with("0x"));
+        assert!(data.len() > 10);
     }
 
     #[tokio::test]

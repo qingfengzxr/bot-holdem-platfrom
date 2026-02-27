@@ -73,13 +73,38 @@
 说明：
 
 - 当前 `rpc-gateway` 已校验时间窗（过期请求拒绝）。
-- `room.bind_session_keys` 已校验绑定声明 proof（Ed25519）。
+- `room.bind_session_keys` 已校验绑定声明 proof（EVM 签名）。
 - 拒绝类请求审计（过期/签名缺失/无效 proof）已接入 `jsonrpsee` 方法入口并写审计行为事件。
 - 重放拒绝审计仍待与防重放存储联动后补全。
 
 ## 3. 方法列表（当前实现）
 
-### 3.1 `room.list`
+### 3.1 `room.create`
+
+请求：
+
+```json
+{}
+```
+
+可选请求参数（指定房间 ID）：
+
+```json
+{
+  "room_id": "uuid"
+}
+```
+
+响应 `data`：
+
+```json
+{
+  "room_id": "uuid",
+  "status": "active"
+}
+```
+
+### 3.2 `room.list`
 
 请求：
 
@@ -100,7 +125,7 @@
 ]
 ```
 
-### 3.2 `room.bind_address`
+### 3.3 `room.bind_address`
 
 请求：
 
@@ -115,7 +140,7 @@
 
 响应 `data`：`null`
 
-### 3.3 `room.bind_session_keys`
+### 3.4 `room.bind_session_keys`
 
 请求：
 
@@ -126,7 +151,7 @@
   "seat_address": "cfx:.... 或 0x....",
   "card_encrypt_pubkey": "hex/base64",
   "request_verify_pubkey": "hex/base64",
-  "key_algo": "x25519+ed25519",
+  "key_algo": "x25519+evm",
   "proof_signature": "hex/base64",
   "request_meta": {}
 }
@@ -211,6 +236,70 @@
   - 非空：进入 `tx_bindings + pending action`，待链上 `matched` 回调才真正推进
 
 响应 `data`：`null`
+
+### 3.7 `game.get_legal_actions`
+
+请求：
+
+```json
+{
+  "room_id": "uuid",
+  "seat_id": 0
+}
+```
+
+响应 `data`：
+
+```json
+[
+  {
+    "seat_id": 0,
+    "action_type": "check",
+    "min_amount": null,
+    "max_amount": null
+  }
+]
+```
+
+### 3.8 `game.get_private_payloads`
+
+请求：
+
+```json
+{
+  "room_id": "uuid",
+  "seat_id": 0,
+  "hand_id": "uuid"
+}
+```
+
+响应 `data`（当前为私有事件列表，典型是 `hole_cards_dealt` 密文）：
+
+```json
+[
+  {
+    "room_id": "uuid",
+    "hand_id": "uuid",
+    "seat_id": 0,
+    "event_name": "hole_cards_dealt",
+    "payload": {
+      "aad": {
+        "room_id": "uuid",
+        "hand_id": "uuid",
+        "seat_id": 0,
+        "event_seq": 1
+      },
+      "envelope": {
+        "key_id": "seat-0-card-key",
+        "algorithm": "x25519+hkdf-sha256+chacha20poly1305",
+        "ephemeral_pubkey_b64": "...",
+        "nonce_b64": "...",
+        "ciphertext_b64": "..."
+      }
+    }
+  }
+]
+```
 
 ## 4. 订阅接口（控制面）
 
@@ -326,14 +415,12 @@
 已实现（MVP 主线）：
 
 - `room.list / room.bind_address / room.bind_session_keys / room.ready`
-- `game.get_state / game.act`
+- `game.get_state / game.get_legal_actions / game.get_private_payloads / game.act`
 - `subscribe.events / unsubscribe.events`
 - `subscribe.events.native / unsubscribe.events.native`
 
 后续计划扩展：
 
-- `game.get_legal_actions`
 - `game.get_hand_history`
 - `game.get_ledger`
 - 更完整的鉴权/签名校验与重放拒绝审计联动
-- 私有 seat 事件（密文 payload）完整对接到发牌流程

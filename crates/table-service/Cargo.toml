@@ -9,7 +9,11 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
+hex.workspace = true
 poker-domain = { path = "../poker-domain" }
 poker-engine = { path = "../poker-engine" }
+seat-crypto = { path = "../seat-crypto" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

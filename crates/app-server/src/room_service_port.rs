@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ledger_store::{ChainTxRepository, NoopChainTxRepository, TxBindingInsert};
 use rpc_gateway::{
-    GameActRequest, GameGetStateRequest, RoomBindAddressRequest, RoomBindSessionKeysRequest,
-    RoomListRequest, RoomReadyRequest, RoomServicePort, RoomSummary, RpcGatewayError,
+    GameActRequest, GameGetPrivatePayloadsRequest, GameGetStateRequest, PrivatePayloadEvent,
+    RoomBindAddressRequest, RoomBindSessionKeysRequest, RoomCreateRequest, RoomListRequest,
+    RoomReadyRequest, RoomServicePort, RoomSummary, RpcGatewayError,
     to_player_action,
 };
 use table_service::{NoopRoomEventSink, RoomEventSink, RoomHandle, spawn_room_actor_with_sink};
@@ -128,6 +129,15 @@ impl AppRoomService {
 
 #[async_trait]
 impl RoomServicePort for AppRoomService {
+    async fn create_room(&self, request: RoomCreateRequest) -> Result<RoomSummary, RpcGatewayError> {
+        let room_id = request.room_id.unwrap_or_else(RoomId::new);
+        let _ = self.ensure_room(room_id)?;
+        Ok(RoomSummary {
+            room_id,
+            status: "active".to_string(),
+        })
+    }
+
     async fn list_rooms(
         &self,
         _request: RoomListRequest,
@@ -149,6 +159,9 @@ impl RoomServicePort for AppRoomService {
 
     async fn ready(&self, request: RoomReadyRequest) -> Result<(), RpcGatewayError> {
         let room = self.get_room(request.room_id)?;
+        room.join(request.seat_id)
+            .await
+            .map_err(RpcGatewayError::Upstream)?;
         room.ready(request.seat_id)
             .await
             .map_err(RpcGatewayError::Upstream)
@@ -156,6 +169,9 @@ impl RoomServicePort for AppRoomService {
 
     async fn bind_address(&self, request: RoomBindAddressRequest) -> Result<(), RpcGatewayError> {
         let room = self.get_room(request.room_id)?;
+        room.join(request.seat_id)
+            .await
+            .map_err(RpcGatewayError::Upstream)?;
         {
             let mut all = self.bound_addresses.lock().map_err(|_| {
                 RpcGatewayError::Upstream("bound address map lock poisoned".to_string())
@@ -174,6 +190,9 @@ impl RoomServicePort for AppRoomService {
         request: RoomBindSessionKeysRequest,
     ) -> Result<(), RpcGatewayError> {
         let room = self.get_room(request.room_id)?;
+        room.join(request.seat_id)
+            .await
+            .map_err(RpcGatewayError::Upstream)?;
         room.bind_session_keys(
             request.seat_id,
             request.card_encrypt_pubkey,
@@ -202,6 +221,27 @@ impl RoomServicePort for AppRoomService {
         room.get_legal_actions(seat_id)
             .await
             .map_err(RpcGatewayError::Upstream)
+    }
+
+    async fn get_private_payloads(
+        &self,
+        request: GameGetPrivatePayloadsRequest,
+    ) -> Result<Vec<PrivatePayloadEvent>, RpcGatewayError> {
+        let room = self.get_room(request.room_id)?;
+        let events = room
+            .get_private_events(request.seat_id, request.hand_id)
+            .await
+            .map_err(RpcGatewayError::Upstream)?;
+        Ok(events
+            .into_iter()
+            .map(|ev| PrivatePayloadEvent {
+                room_id: ev.room_id,
+                hand_id: ev.hand_id,
+                seat_id: ev.seat_id,
+                event_name: ev.event_name,
+                payload: ev.payload,
+            })
+            .collect())
     }
 
     async fn act(&self, request: GameActRequest) -> Result<(), RpcGatewayError> {

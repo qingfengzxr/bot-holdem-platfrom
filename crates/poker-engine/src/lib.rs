@@ -3,7 +3,10 @@ use poker_domain::Street;
 mod engine;
 mod state;
 
-pub use engine::{EngineError, PokerEngine, ShowdownInput, ShowdownResult};
+pub use engine::{
+    DEFAULT_BIG_BLIND, DEFAULT_SMALL_BLIND, EngineError, PokerEngine, ShowdownInput,
+    ShowdownResult,
+};
 pub use state::{
     BettingRoundState, DealingState, EngineState, HandState, PotLayer, PotState, SidePot,
 };
@@ -15,10 +18,69 @@ pub enum EngineActionResult {
 
 #[cfg(test)]
 mod tests {
-    use poker_domain::{ActionType, PlayerAction, RoomId};
+    use poker_domain::{ActionType, PlayerAction, RoomId, SeatId};
     use rs_poker::core::{Card, FlatHand};
 
-    use super::{EngineState, PokerEngine};
+    use super::{DEFAULT_BIG_BLIND, DEFAULT_SMALL_BLIND, EngineState, PokerEngine};
+
+    fn expected_blinds_and_first_to_act(
+        hand_no: u64,
+        seats_sorted: &[SeatId],
+    ) -> (SeatId, SeatId, SeatId) {
+        let n = seats_sorted.len();
+        let dealer_idx = hand_no.saturating_sub(1) as usize % n;
+        if n == 2 {
+            let sb = seats_sorted[dealer_idx];
+            let bb = seats_sorted[(dealer_idx + 1) % n];
+            (sb, bb, sb)
+        } else {
+            let sb = seats_sorted[(dealer_idx + 1) % n];
+            let bb = seats_sorted[(dealer_idx + 2) % n];
+            let first = seats_sorted[(dealer_idx + 3) % n];
+            (sb, bb, first)
+        }
+    }
+
+    fn assert_rotation_for_seat_count(seat_count: usize, hand_count: u64) {
+        let engine = PokerEngine::new();
+        let room_id = RoomId::new();
+        let seats: Vec<SeatId> = (0..seat_count as u8).collect();
+        for hand_no in 1..=hand_count {
+            let mut state = EngineState::new(room_id, hand_no);
+            for seat in &seats {
+                state.seat_player(*seat);
+            }
+            engine
+                .deal_new_hand_internal(&mut state)
+                .expect("deal hand for rotation test");
+            let (sb, bb, first) = expected_blinds_and_first_to_act(hand_no, &seats);
+            assert_eq!(
+                state.betting_round.player_bets.get(&sb).copied(),
+                Some(DEFAULT_SMALL_BLIND)
+            );
+            assert_eq!(
+                state.betting_round.player_bets.get(&bb).copied(),
+                Some(DEFAULT_BIG_BLIND)
+            );
+            assert_eq!(
+                state.betting_round.current_bet,
+                DEFAULT_BIG_BLIND,
+                "hand_no={hand_no} seat_count={seat_count}"
+            );
+            assert_eq!(
+                state.snapshot.pot_total,
+                DEFAULT_SMALL_BLIND
+                    .checked_add(DEFAULT_BIG_BLIND)
+                    .expect("sum blinds"),
+                "hand_no={hand_no} seat_count={seat_count}"
+            );
+            assert_eq!(
+                state.snapshot.acting_seat_id,
+                Some(first),
+                "hand_no={hand_no} seat_count={seat_count}"
+            );
+        }
+    }
 
     #[test]
     fn apply_action_rejects_when_not_players_turn() {
@@ -119,6 +181,21 @@ mod tests {
         assert_eq!(u8::from(dealing.board_cards[3]), 9);
         assert_eq!(u8::from(dealing.burn_cards[2]), 10);
         assert_eq!(u8::from(dealing.board_cards[4]), 11);
+    }
+
+    #[test]
+    fn blind_rotation_matrix_heads_up_continuous_hands() {
+        assert_rotation_for_seat_count(2, 8);
+    }
+
+    #[test]
+    fn blind_rotation_matrix_three_handed_continuous_hands() {
+        assert_rotation_for_seat_count(3, 9);
+    }
+
+    #[test]
+    fn blind_rotation_matrix_four_handed_continuous_hands() {
+        assert_rotation_for_seat_count(4, 12);
     }
 
     #[test]
@@ -470,7 +547,7 @@ mod tests {
             .expect("seat 2 fold");
         assert_eq!(state.snapshot.status, poker_domain::HandStatus::Running);
         assert_eq!(state.snapshot.next_action_seq, 4);
-        assert_eq!(state.snapshot.acting_seat_id, Some(0));
+        assert_eq!(state.snapshot.acting_seat_id, Some(1));
         assert_eq!(state.pot.main_pot, poker_domain::Chips(100));
     }
 
@@ -527,7 +604,7 @@ mod tests {
             )
             .expect("seat 2 check");
 
-        assert_eq!(state.snapshot.acting_seat_id, Some(0));
+        assert_eq!(state.snapshot.acting_seat_id, Some(2));
         assert!(!state.hand.folded_seats.contains(&0));
         assert!(state.hand.folded_seats.contains(&1));
     }
@@ -706,7 +783,7 @@ mod tests {
         assert_eq!(state.snapshot.street, poker_domain::Street::Flop);
         assert_eq!(state.betting_round.current_bet, poker_domain::Chips::ZERO);
         assert_eq!(state.snapshot.status, poker_domain::HandStatus::Running);
-        assert_eq!(state.snapshot.acting_seat_id, Some(0));
+        assert_eq!(state.snapshot.acting_seat_id, Some(1));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use poker_domain::{HandEvent, HandEventKind};
 use rpc_gateway::{EventEnvelope, EventSubscriptionPort, EventTopic, RpcGatewayError};
 use std::sync::Arc;
 use std::time::Duration;
+use table_service::SeatPrivateEvent;
 use tokio::sync::oneshot;
 
 pub async fn publish_pending_outbox_once<R, E>(
@@ -79,6 +80,18 @@ fn to_event_envelope(
                 payload: payload_json,
             }))
         }
+        "seat.events" => {
+            let seat_event: SeatPrivateEvent =
+                serde_json::from_value(payload_json.clone()).map_err(|e| e.to_string())?;
+            Ok(Some(EventEnvelope {
+                topic: EventTopic::SeatEvents,
+                room_id: seat_event.room_id,
+                hand_id: Some(seat_event.hand_id),
+                seat_id: Some(seat_event.seat_id),
+                event_name: seat_event.event_name,
+                payload: seat_event.payload,
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -118,7 +131,7 @@ mod tests {
     use poker_domain::{ActionType, Chips, HandId, PlayerAction, RoomId, TraceId};
     use rpc_gateway::{InMemoryEventBus, SubscribeRequest};
     use std::sync::Arc;
-    use table_service::spawn_room_actor_with_sink;
+    use table_service::{SeatPrivateEvent, spawn_room_actor_with_sink};
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -273,5 +286,52 @@ mod tests {
         assert_eq!(bus.published_count(), 1);
         let pending = repo.fetch_pending_outbox_events(10).await.expect("fetch");
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publishes_seat_private_events_from_outbox_to_event_bus() {
+        let repo = InMemoryAuditRepository::default();
+        let bus = InMemoryEventBus::new();
+        let room_id = RoomId::new();
+        let hand_id = HandId::new();
+        let seat_id = 1_u8;
+
+        let _ = bus
+            .subscribe(SubscribeRequest {
+                topic: EventTopic::SeatEvents,
+                room_id,
+                hand_id: Some(hand_id),
+                seat_id: Some(seat_id),
+            })
+            .await
+            .expect("subscribe");
+
+        let seat_event = SeatPrivateEvent {
+            room_id,
+            hand_id,
+            seat_id,
+            event_name: "hole_cards_dealt".to_string(),
+            payload: serde_json::json!({"ciphertext_b64":"abc"}),
+        };
+
+        repo.insert_outbox_event(&OutboxEventRecord {
+            outbox_event_id: "seat-evt1".to_string(),
+            topic: "seat.events".to_string(),
+            partition_key: format!("{}:{seat_id}", room_id.0),
+            payload_json: serde_json::to_value(&seat_event).expect("serialize"),
+            status: "pending".to_string(),
+            attempts: 0,
+            available_at: Utc::now(),
+            delivered_at: None,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("insert");
+
+        let published = publish_pending_outbox_once(&repo, &bus, 10)
+            .await
+            .expect("publish");
+        assert_eq!(published, 1);
+        assert_eq!(bus.published_count(), 1);
     }
 }

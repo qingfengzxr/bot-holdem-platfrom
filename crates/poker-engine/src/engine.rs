@@ -9,6 +9,11 @@ use thiserror::Error;
 use crate::EngineActionResult;
 use crate::state::{EngineState, PotLayer};
 
+// Fixed blind profile for current MVP:
+// SB = 0.0001 ETH, BB = 0.0002 ETH (in wei-like chip units).
+pub const DEFAULT_SMALL_BLIND: Chips = Chips(100_000_000_000_000);
+pub const DEFAULT_BIG_BLIND: Chips = Chips(200_000_000_000_000);
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -162,6 +167,41 @@ impl PokerEngine {
             board_cards,
             hole_cards,
         });
+        let (small_blind_seat, big_blind_seat, first_to_act) = self
+            .blinds_and_first_to_act(state, &seats)
+            .ok_or(EngineError::NotEnoughPlayersToDeal)?;
+
+        state.snapshot.status = HandStatus::Running;
+        state.snapshot.street = Street::Preflop;
+        state.hand.street = Street::Preflop;
+        state.snapshot.acting_seat_id = Some(first_to_act);
+        state.hand.acting_seat_id = Some(first_to_act);
+        state.betting_round.acting_seat_id = Some(first_to_act);
+        state.betting_round.current_bet = DEFAULT_BIG_BLIND;
+        state.betting_round.min_raise_to =
+            Some(
+                DEFAULT_BIG_BLIND
+                    .checked_add(DEFAULT_BIG_BLIND)
+                    .unwrap_or(DEFAULT_BIG_BLIND),
+            );
+        state.betting_round.player_bets.clear();
+        state.betting_round.acted_seats.clear();
+        state.pot.main_pot = Chips::ZERO;
+        state.pot.side_pots.clear();
+        state.pot.player_contributions.clear();
+
+        state
+            .betting_round
+            .player_bets
+            .insert(small_blind_seat, DEFAULT_SMALL_BLIND);
+        state
+            .betting_round
+            .player_bets
+            .insert(big_blind_seat, DEFAULT_BIG_BLIND);
+        add_contribution(state, small_blind_seat, DEFAULT_SMALL_BLIND)?;
+        add_contribution(state, big_blind_seat, DEFAULT_BIG_BLIND)?;
+        state.pot.main_pot = DEFAULT_SMALL_BLIND.checked_add(DEFAULT_BIG_BLIND)?;
+        state.snapshot.pot_total = state.pot.main_pot;
         Ok(())
     }
 
@@ -241,7 +281,7 @@ impl PokerEngine {
                 if is_raise {
                     state.betting_round.current_bet = target;
                     state.betting_round.min_raise_to =
-                        Some(target.checked_add(Chips(1)).unwrap_or(target));
+                        Some(next_min_raise_to(current_bet, target));
                 }
                 state.pot.main_pot = state.pot.main_pot.checked_add(delta)?;
                 add_contribution(state, action.seat_id, delta)?;
@@ -489,12 +529,80 @@ impl PokerEngine {
         state.betting_round.player_bets.clear();
         state.betting_round.acted_seats.clear();
 
-        let next_seat = active_seats[0];
+        let next_seat = self
+            .next_active_seat_left_of_button(state, active_seats)
+            .unwrap_or(active_seats[0]);
         state.snapshot.acting_seat_id = Some(next_seat);
         state.hand.acting_seat_id = Some(next_seat);
         state.betting_round.acting_seat_id = Some(next_seat);
         Some(next_street)
     }
+
+    fn blinds_and_first_to_act(
+        &self,
+        state: &EngineState,
+        seats_sorted: &[SeatId],
+    ) -> Option<(SeatId, SeatId, SeatId)> {
+        if seats_sorted.len() < 2 {
+            return None;
+        }
+        let n = seats_sorted.len();
+        let dealer_idx = state_dealer_index(state.snapshot.hand_no, n);
+        if n == 2 {
+            let sb = seats_sorted[dealer_idx];
+            let bb = seats_sorted[(dealer_idx + 1) % n];
+            Some((sb, bb, sb))
+        } else {
+            let sb = seats_sorted[(dealer_idx + 1) % n];
+            let bb = seats_sorted[(dealer_idx + 2) % n];
+            let first = seats_sorted[(dealer_idx + 3) % n];
+            Some((sb, bb, first))
+        }
+    }
+
+    fn next_active_seat_left_of_button(
+        &self,
+        state: &EngineState,
+        active_seats_sorted: &[SeatId],
+    ) -> Option<SeatId> {
+        if active_seats_sorted.is_empty() {
+            return None;
+        }
+        let mut seated_sorted: Vec<_> = state.hand.seated_players.iter().copied().collect();
+        seated_sorted.sort_unstable();
+        let dealer_idx = state_dealer_index(state.snapshot.hand_no, seated_sorted.len());
+        let dealer = seated_sorted.get(dealer_idx).copied()?;
+        let start = seated_sorted
+            .iter()
+            .position(|seat| *seat == dealer)
+            .unwrap_or(0);
+        for step in 1..=seated_sorted.len() {
+            let candidate = seated_sorted[(start + step) % seated_sorted.len()];
+            if active_seats_sorted.contains(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+fn state_dealer_index(hand_no: u64, seat_count: usize) -> usize {
+    if seat_count == 0 {
+        return 0;
+    }
+    hand_no.saturating_sub(1) as usize % seat_count
+}
+
+fn next_min_raise_to(current_bet: Chips, target_bet: Chips) -> Chips {
+    let raise_size = target_bet
+        .checked_sub(current_bet)
+        .unwrap_or(Chips::ZERO);
+    if raise_size == Chips::ZERO {
+        return target_bet;
+    }
+    target_bet
+        .checked_add(raise_size)
+        .unwrap_or(target_bet)
 }
 
 fn ordered_deck() -> Vec<Card> {

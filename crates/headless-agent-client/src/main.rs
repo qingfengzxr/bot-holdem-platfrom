@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         legal_actions: turn.legal_actions.clone(),
         public_state_json: serde_json::json!({}),
         private_state_json: None,
+        decision_context_json: None,
     };
     let policy_decision = llm_policy
         .decide_action(&policy_input)

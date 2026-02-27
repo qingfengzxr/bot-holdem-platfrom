@@ -17,6 +17,7 @@ observability = { path = "../observability" }
 platform-core = { path = "../platform-core" }
 poker-domain = { path = "../poker-domain" }
 rpc-gateway = { path = "../rpc-gateway" }
+seat-crypto = { path = "../seat-crypto" }
 table-service = { path = "../table-service" }
 reqwest.workspace = true
 serde.workspace = true

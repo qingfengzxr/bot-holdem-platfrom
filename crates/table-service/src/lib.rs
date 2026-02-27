@@ -3,11 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use hex::FromHex;
 use poker_domain::{
     ActionType, AuditBehaviorEventKind, HandEvent, HandEventKind, HandId, HandSnapshot, HandStatus,
     LegalAction, PlayerAction, RoomId, SeatId, TraceId,
 };
 use poker_engine::{EngineActionResult, EngineState, PokerEngine};
+use seat_crypto::{SeatEventAad, encrypt_hole_cards_dealt_payload};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -44,6 +47,11 @@ pub enum RoomCommand {
     GetLegalActions {
         seat_id: SeatId,
         reply: oneshot::Sender<Vec<LegalAction>>,
+    },
+    GetPrivateEvents {
+        seat_id: SeatId,
+        hand_id: Option<HandId>,
+        reply: oneshot::Sender<Vec<SeatPrivateEvent>>,
     },
     Act {
         action: PlayerAction,
@@ -158,6 +166,23 @@ impl RoomHandle {
         rx.await.map_err(|_| "room actor dropped reply".to_string())
     }
 
+    pub async fn get_private_events(
+        &self,
+        seat_id: SeatId,
+        hand_id: Option<HandId>,
+    ) -> Result<Vec<SeatPrivateEvent>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(RoomCommand::GetPrivateEvents {
+                seat_id,
+                hand_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| "room actor unavailable".to_string())?;
+        rx.await.map_err(|_| "room actor dropped reply".to_string())
+    }
+
     pub async fn act(&self, action: PlayerAction) -> Result<EngineActionResult, String> {
         let (tx, rx) = oneshot::channel();
         self.sender
@@ -225,12 +250,25 @@ pub struct RoomBehaviorEvent {
     pub kind: AuditBehaviorEventKind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatPrivateEvent {
+    pub room_id: RoomId,
+    pub hand_id: HandId,
+    pub seat_id: SeatId,
+    pub event_name: String,
+    pub payload: serde_json::Value,
+}
+
 pub trait RoomEventSink: Send + Sync {
     fn append_hand_events(&self, _events: &[HandEvent]) -> Result<(), String> {
         Ok(())
     }
 
     fn record_behavior_event(&self, _event: &RoomBehaviorEvent) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn append_private_events(&self, _events: &[SeatPrivateEvent]) -> Result<(), String> {
         Ok(())
     }
 }
@@ -244,6 +282,7 @@ impl RoomEventSink for NoopRoomEventSink {}
 pub struct InMemoryRoomEventSink {
     hand_events: std::sync::Mutex<Vec<HandEvent>>,
     behavior_events: std::sync::Mutex<Vec<RoomBehaviorEvent>>,
+    private_events: std::sync::Mutex<Vec<SeatPrivateEvent>>,
 }
 
 impl InMemoryRoomEventSink {
@@ -260,6 +299,10 @@ impl InMemoryRoomEventSink {
         self.behavior_events.lock().map_or(0, |events| events.len())
     }
 
+    pub fn private_events_len(&self) -> usize {
+        self.private_events.lock().map_or(0, |events| events.len())
+    }
+
     pub fn hand_events_snapshot(&self) -> Vec<HandEvent> {
         self.hand_events
             .lock()
@@ -268,6 +311,12 @@ impl InMemoryRoomEventSink {
 
     pub fn behavior_events_snapshot(&self) -> Vec<RoomBehaviorEvent> {
         self.behavior_events
+            .lock()
+            .map_or_else(|_| Vec::new(), |events| events.clone())
+    }
+
+    pub fn private_events_snapshot(&self) -> Vec<SeatPrivateEvent> {
+        self.private_events
             .lock()
             .map_or_else(|_| Vec::new(), |events| events.clone())
     }
@@ -289,6 +338,15 @@ impl RoomEventSink for InMemoryRoomEventSink {
             .lock()
             .map_err(|_| "behavior_events mutex poisoned".to_string())?;
         guard.push(event.clone());
+        Ok(())
+    }
+
+    fn append_private_events(&self, events: &[SeatPrivateEvent]) -> Result<(), String> {
+        let mut guard = self
+            .private_events
+            .lock()
+            .map_err(|_| "private_events mutex poisoned".to_string())?;
+        guard.extend_from_slice(events);
         Ok(())
     }
 }
@@ -335,6 +393,7 @@ pub fn spawn_room_actor_with_sink(
         let mut request_pubkeys: HashMap<SeatId, String> = HashMap::new();
         let mut card_pubkeys: HashMap<SeatId, String> = HashMap::new();
         let mut pending_chain_actions: HashMap<String, PendingChainAction> = HashMap::new();
+        let mut private_events: Vec<SeatPrivateEvent> = Vec::new();
         let mut timeout_generation: u64 = 0;
         let mut next_hand_event_seq: u32 = 1;
 
@@ -410,6 +469,20 @@ pub fn spawn_room_actor_with_sink(
                             && has_req_key
                         {
                             state.start(seat_id);
+                            if state.hand.seated_players.len() >= 2 {
+                                if let Err(err) = engine.deal_new_hand_internal(&mut state) {
+                                    warn!(?room_id, seat_id, error = %err, "deal_new_hand_internal failed");
+                                }
+                            }
+                            let new_private_events = build_hole_cards_private_events(
+                                &state,
+                                &card_pubkeys,
+                                next_hand_event_seq,
+                            );
+                            if !new_private_events.is_empty() {
+                                private_events.extend(new_private_events.clone());
+                                let _ = event_sink.append_private_events(&new_private_events);
+                            }
                             let hand_events = vec![
                                 new_hand_event(
                                     room_id,
@@ -427,6 +500,27 @@ pub fn spawn_room_actor_with_sink(
                             let _ = event_sink.append_hand_events(&hand_events);
                             timeout_generation = timeout_generation.saturating_add(1);
                             spawn_turn_timeout(actor_sender.clone(), timeout_generation);
+                        } else if matches!(state.snapshot.status, HandStatus::Running)
+                            && state.dealing.is_none()
+                            && state.hand.seated_players.len() >= 2
+                            && has_addr
+                            && has_card_key
+                            && has_req_key
+                        {
+                            if let Err(err) = engine.deal_new_hand_internal(&mut state) {
+                                warn!(?room_id, seat_id, error = %err, "deal_new_hand_internal late-start failed");
+                            }
+                            let new_private_events = build_hole_cards_private_events(
+                                &state,
+                                &card_pubkeys,
+                                next_hand_event_seq,
+                            );
+                            if !new_private_events.is_empty() {
+                                private_events.extend(new_private_events.clone());
+                                let _ = event_sink.append_private_events(&new_private_events);
+                            }
+                            timeout_generation = timeout_generation.saturating_add(1);
+                            spawn_turn_timeout(actor_sender.clone(), timeout_generation);
                         }
                     }
                 }
@@ -439,6 +533,19 @@ pub fn spawn_room_actor_with_sink(
                 RoomCommand::GetLegalActions { seat_id, reply } => {
                     let legal_actions = engine.legal_actions(&state, seat_id);
                     let _ = reply.send(legal_actions);
+                }
+                RoomCommand::GetPrivateEvents {
+                    seat_id,
+                    hand_id,
+                    reply,
+                } => {
+                    let filtered = private_events
+                        .iter()
+                        .filter(|ev| ev.seat_id == seat_id)
+                        .filter(|ev| hand_id.is_none_or(|h| ev.hand_id == h))
+                        .cloned()
+                        .collect();
+                    let _ = reply.send(filtered);
                 }
                 RoomCommand::Act { action, reply } => {
                     let submitted_action = action.clone();
@@ -722,9 +829,59 @@ fn spawn_turn_timeout(sender: mpsc::Sender<RoomCommand>, generation: u64) {
     });
 }
 
+fn build_hole_cards_private_events(
+    state: &EngineState,
+    card_pubkeys: &HashMap<SeatId, String>,
+    event_seq: u32,
+) -> Vec<SeatPrivateEvent> {
+    let Some(dealing) = state.dealing.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (seat_id, cards) in &dealing.hole_cards {
+        let Some(pubkey_hex) = card_pubkeys.get(seat_id) else {
+            continue;
+        };
+        let Ok(recipient_public) = <[u8; 32]>::from_hex(pubkey_hex) else {
+            continue;
+        };
+        let aad = SeatEventAad {
+            room_id: state.snapshot.room_id,
+            hand_id: state.snapshot.hand_id,
+            seat_id: *seat_id,
+            event_seq,
+        };
+        let Ok(plaintext) = serde_json::to_vec(&serde_json::json!({
+            "cards": [u8::from(cards[0]), u8::from(cards[1])],
+        })) else {
+            continue;
+        };
+        let Ok(payload) = encrypt_hole_cards_dealt_payload(
+            format!("seat-card-key-{seat_id}"),
+            &recipient_public,
+            aad,
+            &plaintext,
+        ) else {
+            continue;
+        };
+        let Ok(payload_json) = serde_json::to_value(payload) else {
+            continue;
+        };
+        out.push(SeatPrivateEvent {
+            room_id: state.snapshot.room_id,
+            hand_id: state.snapshot.hand_id,
+            seat_id: *seat_id,
+            event_name: "hole_cards_dealt".to_string(),
+            payload: payload_json,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seat_crypto::{HoleCardsDealtCipherPayload, X25519KeyPair, decrypt_with_recipient_x25519};
 
     #[tokio::test]
     async fn room_actor_records_chain_callback_behavior_event() {
@@ -772,6 +929,61 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(sink.hand_events_len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn room_ready_emits_encrypted_hole_cards_private_events_for_each_seat() {
+        let room_id = RoomId::new();
+        let sink = Arc::new(InMemoryRoomEventSink::new());
+        let room = spawn_room_actor_with_sink(room_id, 16, sink.clone());
+        let key0 = X25519KeyPair::generate();
+        let key1 = X25519KeyPair::generate();
+
+        room.join(0).await.expect("join 0");
+        room.join(1).await.expect("join 1");
+        room.bind_address(0, "cfx:seat0".to_string())
+            .await
+            .expect("bind addr0");
+        room.bind_address(1, "cfx:seat1".to_string())
+            .await
+            .expect("bind addr1");
+        room.bind_session_keys(
+            0,
+            hex::encode(key0.public),
+            "sigpk0".to_string(),
+            "x25519+evm".to_string(),
+            "proof0".to_string(),
+        )
+        .await
+        .expect("bind keys0");
+        room.bind_session_keys(
+            1,
+            hex::encode(key1.public),
+            "sigpk1".to_string(),
+            "x25519+evm".to_string(),
+            "proof1".to_string(),
+        )
+        .await
+        .expect("bind keys1");
+        room.ready(0).await.expect("ready");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let private_events = sink.private_events_snapshot();
+        assert_eq!(private_events.len(), 2);
+        for ev in private_events {
+            assert_eq!(ev.event_name, "hole_cards_dealt");
+            let payload: HoleCardsDealtCipherPayload =
+                serde_json::from_value(ev.payload.clone()).expect("parse payload");
+            let secret = if ev.seat_id == 0 { key0.secret } else { key1.secret };
+            let plaintext = decrypt_with_recipient_x25519(&secret, &payload.aad, &payload.envelope)
+                .expect("decrypt");
+            let value: serde_json::Value = serde_json::from_slice(&plaintext).expect("json");
+            let cards = value
+                .get("cards")
+                .and_then(|v| v.as_array())
+                .expect("cards array");
+            assert_eq!(cards.len(), 2);
+        }
     }
 
     #[tokio::test]
@@ -844,7 +1056,7 @@ mod tests {
             hand_id: before.hand_id,
             action_seq: before.next_action_seq,
             seat_id: before.acting_seat_id.expect("acting seat"),
-            action_type: ActionType::Check,
+            action_type: ActionType::Call,
             amount: None,
         };
 
@@ -905,7 +1117,7 @@ mod tests {
             hand_id,
             action_seq: snapshot.next_action_seq,
             seat_id: snapshot.acting_seat_id.expect("acting seat"),
-            action_type: ActionType::Check,
+            action_type: ActionType::Call,
             amount: None,
         })
         .await
@@ -978,7 +1190,13 @@ mod tests {
                 hand_id: snapshot.hand_id,
                 action_seq: snapshot.next_action_seq,
                 seat_id: snapshot.acting_seat_id.expect("acting seat"),
-                action_type: ActionType::Check,
+                action_type: if snapshot.street == poker_domain::Street::Preflop
+                    && snapshot.next_action_seq == 1
+                {
+                    ActionType::Call
+                } else {
+                    ActionType::Check
+                },
                 amount: None,
             };
             room.act(action).await.expect("check");
@@ -1040,7 +1258,13 @@ mod tests {
                 hand_id: snapshot.hand_id,
                 action_seq: snapshot.next_action_seq,
                 seat_id: snapshot.acting_seat_id.expect("acting seat"),
-                action_type: ActionType::Check,
+                action_type: if snapshot.street == poker_domain::Street::Preflop
+                    && snapshot.next_action_seq == 1
+                {
+                    ActionType::Call
+                } else {
+                    ActionType::Check
+                },
                 amount: None,
             })
             .await
