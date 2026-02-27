@@ -577,8 +577,18 @@ pub fn spawn_room_actor_with_sink(
                     action,
                     reply,
                 } => {
+                    let queued_action = action.clone();
                     let _ = pending_chain_actions
                         .insert(tx_hash.clone(), PendingChainAction { action });
+                    debug!(
+                        ?room_id,
+                        hand_id = %queued_action.hand_id.0,
+                        seat_id = queued_action.seat_id,
+                        action_seq = queued_action.action_seq,
+                        action_type = %format!("{:?}", queued_action.action_type).to_ascii_lowercase(),
+                        tx_hash = %tx_hash,
+                        "pending action queued"
+                    );
                     let _ = event_sink.record_behavior_event(&new_behavior_event(
                         room_id,
                         AuditBehaviorEventKind::ChainTxVerificationCallback {
@@ -598,6 +608,15 @@ pub fn spawn_room_actor_with_sink(
                         && let Some(pending) = pending_chain_actions.remove(&callback.tx_hash)
                     {
                         let submitted_action = pending.action.clone();
+                        debug!(
+                            ?room_id,
+                            hand_id = %submitted_action.hand_id.0,
+                            seat_id = submitted_action.seat_id,
+                            action_seq = submitted_action.action_seq,
+                            action_type = %format!("{:?}", submitted_action.action_type).to_ascii_lowercase(),
+                            tx_hash = %callback.tx_hash,
+                            "pending action applied"
+                        );
                         let result = engine
                             .apply_action(&mut state, pending.action)
                             .map_err(|err| err.to_string());

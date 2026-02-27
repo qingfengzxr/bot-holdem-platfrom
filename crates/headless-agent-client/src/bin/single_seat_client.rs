@@ -200,6 +200,16 @@ where
     if *last_attempted_turn == Some(turn_key) {
         return Ok(());
     }
+    if let Some(private_state) = turn.policy_input.private_state_json.as_ref()
+        && let Some(cards) = private_state.get("decrypted_hole_cards")
+    {
+        info!(
+            hand_id = %turn.hand_id.0,
+            action_seq = turn.action_seq,
+            hole_cards = %cards,
+            "received hole cards"
+        );
+    }
 
     let decision = match policy_mode {
         PolicyMode::Rule => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),
@@ -212,6 +222,15 @@ where
         warn!("no policy decision available");
         return Ok(());
     };
+    info!(
+        hand_id = %turn.hand_id.0,
+        action_seq = turn.action_seq,
+        action_type = %format!("{:?}", decision.action_type).to_ascii_lowercase(),
+        amount = ?decision.amount.map(|v| v.as_u128()),
+        rationale = ?decision.rationale,
+        source = ?decision.source,
+        "policy decision resolved"
+    );
 
     let Ok(latest_turn) = collect_turn_decision_input(cfg.clone(), None).await else {
         return Ok(());
@@ -264,7 +283,7 @@ async fn subscribe_turn_events(
         topic: EventTopic::HandEvents,
         room_id: cfg.room_id,
         hand_id: None,
-        seat_id: Some(cfg.seat_id),
+        seat_id: None,
     };
     let req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -423,6 +442,12 @@ async fn main() -> Result<()> {
                             let Ok(event) = serde_json::from_value::<EventEnvelope>(event_json.clone()) else {
                                 continue;
                             };
+                            if event.event_name == "hand_closed" {
+                                info!(
+                                    hand_id = ?event.hand_id.map(|v| v.0),
+                                    "hand closed event received"
+                                );
+                            }
                             if event.event_name != "turn_started" {
                                 continue;
                             }
