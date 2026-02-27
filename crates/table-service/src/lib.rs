@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use hex::FromHex;
@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_REMINDER_INTERVAL: Duration = Duration::from_secs(20);
+const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum RoomCommand {
@@ -75,6 +76,7 @@ pub enum RoomCommand {
     TurnReminderElapsed {
         expected_generation: u64,
     },
+    SchedulerTick,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +248,15 @@ struct PendingChainAction {
     action: PlayerAction,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TurnSchedulerState {
+    hand_id: HandId,
+    action_seq: u32,
+    seat_id: SeatId,
+    started_at: Instant,
+    last_reminder_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RoomBehaviorEvent {
     pub room_id: RoomId,
@@ -389,6 +400,7 @@ pub fn spawn_room_actor_with_sink(
 
     tokio::spawn(async move {
         let actor_sender = tx.clone();
+        spawn_scheduler_tick(actor_sender.clone());
         let engine = PokerEngine::new();
         let mut state = EngineState::new(room_id, 1);
         let mut seated: HashSet<SeatId> = HashSet::new();
@@ -400,6 +412,7 @@ pub fn spawn_room_actor_with_sink(
         let mut private_events: Vec<SeatPrivateEvent> = Vec::new();
         let mut timeout_generation: u64 = 0;
         let mut next_hand_event_seq: u32 = 1;
+        let mut turn_scheduler: Option<TurnSchedulerState> = None;
 
         while let Some(cmd) = rx.recv().await {
             match cmd {
@@ -503,8 +516,7 @@ pub fn spawn_room_actor_with_sink(
                             ];
                             let _ = event_sink.append_hand_events(&hand_events);
                             timeout_generation = timeout_generation.saturating_add(1);
-                            spawn_turn_timeout(actor_sender.clone(), timeout_generation);
-                            spawn_turn_reminder(actor_sender.clone(), timeout_generation);
+                            turn_scheduler = None;
                         } else if matches!(state.snapshot.status, HandStatus::Running)
                             && state.dealing.is_none()
                             && state.hand.seated_players.len() >= 2
@@ -525,8 +537,7 @@ pub fn spawn_room_actor_with_sink(
                                 let _ = event_sink.append_private_events(&new_private_events);
                             }
                             timeout_generation = timeout_generation.saturating_add(1);
-                            spawn_turn_timeout(actor_sender.clone(), timeout_generation);
-                            spawn_turn_reminder(actor_sender.clone(), timeout_generation);
+                            turn_scheduler = None;
                         }
                     }
                 }
@@ -567,8 +578,8 @@ pub fn spawn_room_actor_with_sink(
                             *engine_result,
                             &mut next_hand_event_seq,
                             &mut timeout_generation,
-                            actor_sender.clone(),
                         );
+                        turn_scheduler = None;
                     }
                     let _ = reply.send(result);
                 }
@@ -629,8 +640,8 @@ pub fn spawn_room_actor_with_sink(
                                 *engine_result,
                                 &mut next_hand_event_seq,
                                 &mut timeout_generation,
-                                actor_sender.clone(),
                             );
+                            turn_scheduler = None;
                         }
                     }
 
@@ -652,6 +663,7 @@ pub fn spawn_room_actor_with_sink(
                             HandEventKind::HandClosed,
                         )]);
                         timeout_generation = timeout_generation.saturating_add(1);
+                        turn_scheduler = None;
                     }
 
                     let _ = event_sink.record_behavior_event(&new_behavior_event(
@@ -691,6 +703,7 @@ pub fn spawn_room_actor_with_sink(
                             HandEventKind::HandClosed,
                         )]);
                         timeout_generation = timeout_generation.saturating_add(1);
+                        turn_scheduler = None;
                     }
                 }
                 RoomCommand::TurnTimeoutElapsed {
@@ -732,10 +745,11 @@ pub fn spawn_room_actor_with_sink(
                             *engine_result,
                             &mut next_hand_event_seq,
                             &mut timeout_generation,
-                            actor_sender.clone(),
                         );
+                        turn_scheduler = None;
                     } else {
                         timeout_generation = timeout_generation.saturating_add(1);
+                        turn_scheduler = None;
                     }
                     let _ = event_sink.record_behavior_event(&new_behavior_event(
                         room_id,
@@ -770,7 +784,110 @@ pub fn spawn_room_actor_with_sink(
                             seat_id: acting_seat_id,
                         },
                     )]);
-                    spawn_turn_reminder(actor_sender.clone(), timeout_generation);
+                }
+                RoomCommand::SchedulerTick => {
+                    let Some(acting_seat_id) = state.snapshot.acting_seat_id else {
+                        turn_scheduler = None;
+                        continue;
+                    };
+                    if !matches!(state.snapshot.status, HandStatus::Running) {
+                        turn_scheduler = None;
+                        continue;
+                    }
+
+                    let now = Instant::now();
+                    let hand_id = state.snapshot.hand_id;
+                    let action_seq = state.snapshot.next_action_seq;
+                    let needs_reset = turn_scheduler.as_ref().is_none_or(|s| {
+                        s.hand_id != hand_id
+                            || s.action_seq != action_seq
+                            || s.seat_id != acting_seat_id
+                    });
+                    if needs_reset {
+                        turn_scheduler = Some(TurnSchedulerState {
+                            hand_id,
+                            action_seq,
+                            seat_id: acting_seat_id,
+                            started_at: now,
+                            last_reminder_at: None,
+                        });
+                        continue;
+                    }
+
+                    let mut should_timeout = false;
+                    let mut should_remind = false;
+                    if let Some(s) = turn_scheduler.as_mut() {
+                        let elapsed = now.duration_since(s.started_at);
+                        if elapsed >= DEFAULT_STEP_TIMEOUT {
+                            should_timeout = true;
+                        } else {
+                            let remind_due = match s.last_reminder_at {
+                                Some(last) => now.duration_since(last) >= TURN_REMINDER_INTERVAL,
+                                None => elapsed >= TURN_REMINDER_INTERVAL,
+                            };
+                            if remind_due {
+                                s.last_reminder_at = Some(now);
+                                should_remind = true;
+                            }
+                        }
+                    }
+
+                    if should_timeout {
+                        warn!(
+                            ?room_id,
+                            seat_id = acting_seat_id,
+                            action_seq,
+                            "turn timeout elapsed, applying auto-fold"
+                        );
+                        let auto_fold = PlayerAction {
+                            room_id,
+                            hand_id,
+                            action_seq,
+                            seat_id: acting_seat_id,
+                            action_type: ActionType::Fold,
+                            amount: None,
+                        };
+                        let submitted_action = auto_fold.clone();
+                        let result = engine
+                            .apply_action(&mut state, auto_fold)
+                            .map_err(|err| err.to_string());
+                        if let Ok(engine_result) = result.as_ref() {
+                            emit_post_action_hand_events(
+                                &*event_sink,
+                                room_id,
+                                &state,
+                                submitted_action,
+                                *engine_result,
+                                &mut next_hand_event_seq,
+                                &mut timeout_generation,
+                            );
+                        } else {
+                            timeout_generation = timeout_generation.saturating_add(1);
+                        }
+                        let _ = event_sink.record_behavior_event(&new_behavior_event(
+                            room_id,
+                            AuditBehaviorEventKind::TurnTimeoutAutoFold {
+                                seat_id: acting_seat_id,
+                                action_seq: state.snapshot.next_action_seq.saturating_sub(1),
+                            },
+                        ));
+                        turn_scheduler = None;
+                    } else if should_remind {
+                        warn!(
+                            ?room_id,
+                            seat_id = acting_seat_id,
+                            action_seq,
+                            "turn reminder elapsed, notifying acting seat"
+                        );
+                        let _ = event_sink.append_hand_events(&[new_hand_event(
+                            room_id,
+                            hand_id,
+                            &mut next_hand_event_seq,
+                            HandEventKind::TurnStarted {
+                                seat_id: acting_seat_id,
+                            },
+                        )]);
+                    }
                 }
             }
         }
@@ -814,7 +931,6 @@ fn emit_post_action_hand_events(
     engine_result: EngineActionResult,
     next_hand_event_seq: &mut u32,
     timeout_generation: &mut u64,
-    actor_sender: mpsc::Sender<RoomCommand>,
 ) {
     let mut hand_events = vec![
         new_hand_event(
@@ -853,8 +969,6 @@ fn emit_post_action_hand_events(
             },
         ));
         *timeout_generation = timeout_generation.saturating_add(1);
-        spawn_turn_timeout(actor_sender.clone(), *timeout_generation);
-        spawn_turn_reminder(actor_sender, *timeout_generation);
     } else if matches!(
         state.snapshot.status,
         HandStatus::Settled | HandStatus::Aborted
@@ -871,25 +985,15 @@ fn emit_post_action_hand_events(
     let _ = event_sink.append_hand_events(&hand_events);
 }
 
-fn spawn_turn_timeout(sender: mpsc::Sender<RoomCommand>, generation: u64) {
+fn spawn_scheduler_tick(sender: mpsc::Sender<RoomCommand>) {
     tokio::spawn(async move {
-        tokio::time::sleep(DEFAULT_STEP_TIMEOUT).await;
-        let _ = sender
-            .send(RoomCommand::TurnTimeoutElapsed {
-                expected_generation: generation,
-            })
-            .await;
-    });
-}
-
-fn spawn_turn_reminder(sender: mpsc::Sender<RoomCommand>, generation: u64) {
-    tokio::spawn(async move {
-        tokio::time::sleep(TURN_REMINDER_INTERVAL).await;
-        let _ = sender
-            .send(RoomCommand::TurnReminderElapsed {
-                expected_generation: generation,
-            })
-            .await;
+        let mut ticker = tokio::time::interval(SCHEDULER_TICK_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if sender.send(RoomCommand::SchedulerTick).await.is_err() {
+                break;
+            }
+        }
     });
 }
 
