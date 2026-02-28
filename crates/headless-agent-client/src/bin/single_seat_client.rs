@@ -179,6 +179,52 @@ fn derive_ws_endpoint(http_endpoint: &str) -> String {
     http_endpoint.to_string()
 }
 
+fn card_index_to_notation(index: u64) -> Option<String> {
+    if index >= 52 {
+        return None;
+    }
+    let value = match index % 13 {
+        0 => "2",
+        1 => "3",
+        2 => "4",
+        3 => "5",
+        4 => "6",
+        5 => "7",
+        6 => "8",
+        7 => "9",
+        8 => "T",
+        9 => "J",
+        10 => "Q",
+        11 => "K",
+        12 => "A",
+        _ => return None,
+    };
+    let suit = match index / 13 {
+        0 => "s",
+        1 => "c",
+        2 => "h",
+        3 => "d",
+        _ => return None,
+    };
+    Some(format!("{value}{suit}"))
+}
+
+fn pretty_hole_cards(private_state: &serde_json::Value) -> Option<Vec<Vec<String>>> {
+    let entries = private_state.get("decrypted_hole_cards")?.as_array()?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let cards = entry.get("cards")?.as_array()?;
+        let mut pair = Vec::with_capacity(cards.len());
+        for c in cards {
+            let idx = c.as_u64()?;
+            let notation = card_index_to_notation(idx)?;
+            pair.push(notation);
+        }
+        out.push(pair);
+    }
+    Some(out)
+}
+
 async fn maybe_execute_turn<W>(
     cfg: &SingleActionRunnerConfig,
     wallet: &W,
@@ -203,10 +249,12 @@ where
     if let Some(private_state) = turn.policy_input.private_state_json.as_ref()
         && let Some(cards) = private_state.get("decrypted_hole_cards")
     {
+        let pretty_cards = pretty_hole_cards(private_state);
         info!(
             hand_id = %turn.hand_id.0,
             action_seq = turn.action_seq,
-            hole_cards = %cards,
+            hole_cards_raw = %cards,
+            hole_cards_pretty = ?pretty_cards,
             "received hole cards"
         );
     }
@@ -355,7 +403,7 @@ async fn main() -> Result<()> {
     let wallet_rpc = env_optional("WALLET_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let wallet = JsonRpcEvmWalletAdapter::new(wallet_rpc.clone());
     let chain_id = env_parse_u64("CHAIN_ID", 31_337)?;
-    let policy_timeout_ms = env_parse_u64("POLICY_TIMEOUT_MS", 1_500)?;
+    let policy_timeout_ms = env_parse_u64("POLICY_TIMEOUT_MS", 180_000)?;
     let safety_poll_ms = env_parse_u64("CLIENT_SAFETY_POLL_MS", 2_000)?;
     let context_max_entries = env_parse_u64("POLICY_CONTEXT_MAX_ENTRIES", 16)? as usize;
     let policy_mode = parse_policy_mode();

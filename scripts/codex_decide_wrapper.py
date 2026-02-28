@@ -108,7 +108,16 @@ def main() -> int:
 
     codex_cmd = os.environ.get("CODEX_WRAPPER_CMD", "codex")
     codex_args = shlex.split(os.environ.get("CODEX_WRAPPER_ARGS", ""))
-    timeout_ms = int(os.environ.get("CODEX_WRAPPER_TIMEOUT_MS", "1400"))
+    if codex_cmd == "codex" and not codex_args:
+        # Non-interactive mode is required for wrapper subprocess usage.
+        codex_args = ["exec"]
+    timeout_ms = int(os.environ.get("CODEX_WRAPPER_TIMEOUT_MS", "180000"))
+    debug = os.environ.get("CODEX_WRAPPER_DEBUG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     prompt = _build_codex_prompt(payload)
     decision_raw: Optional[Dict[str, Any]] = None
@@ -121,9 +130,36 @@ def main() -> int:
             timeout=max(timeout_ms, 100) / 1000.0,
             check=False,
         )
-        if proc.returncode == 0:
-            decision_raw = _extract_json_object(proc.stdout.strip())
+        if debug:
+            print(
+                json.dumps(
+                    {
+                        "wrapper_debug": {
+                            "cmd": [codex_cmd, *codex_args],
+                            "returncode": proc.returncode,
+                            "stdout_preview": proc.stdout[:500],
+                            "stderr_preview": proc.stderr[:500],
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+        decision_raw = _extract_json_object(proc.stdout.strip())
     except Exception:
+        if debug:
+            print(
+                json.dumps(
+                    {
+                        "wrapper_debug": {
+                            "cmd": [codex_cmd, *codex_args],
+                            "exception": "subprocess_run_failed",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
         decision_raw = None
 
     if decision_raw is None:
@@ -140,4 +176,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

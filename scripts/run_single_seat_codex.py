@@ -79,7 +79,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chain-id", default="31337")
     p.add_argument("--tx-value", default="1")
     p.add_argument("--tick-ms", default="800")
-    p.add_argument("--policy-timeout-ms", default="1500")
+    p.add_argument("--policy-timeout-ms", default="180000")
+    p.add_argument("--codex-wrapper-timeout-ms", default="180000")
     p.add_argument("--policy-context-max-entries", default="16")
     p.add_argument("--codex-wrapper-cmd", default="codex")
     p.add_argument("--codex-wrapper-args", default="")
@@ -234,6 +235,7 @@ def main() -> int:
             "CODEX_CLI_BIN": args.codex_cli_bin,
             "CODEX_WRAPPER_CMD": args.codex_wrapper_cmd,
             "CODEX_WRAPPER_ARGS": args.codex_wrapper_args,
+            "CODEX_WRAPPER_TIMEOUT_MS": str(args.codex_wrapper_timeout_ms),
             "POLICY_TIMEOUT_MS": str(args.policy_timeout_ms),
             "POLICY_CONTEXT_MAX_ENTRIES": str(args.policy_context_max_entries),
             "CARD_ENCRYPT_PUBKEY_HEX": pub_hex,

@@ -272,4 +272,166 @@ mod tests {
         assert_eq!(decision.action_type, ActionType::Check);
         assert_eq!(decision.source, PolicySource::Rule);
     }
+
+    #[tokio::test]
+    async fn codex_cli_policy_adapter_can_exchange_stdio_with_cli_process() {
+        let bin = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let args = vec![
+            "-c".to_string(),
+            "import json,sys; _=sys.stdin.read(); print(json.dumps({'action_type':'call','amount':None,'rationale':'mock_cli_ok'}))".to_string(),
+        ];
+        let policy = CodexCliPolicyAdapter::new(bin, args, Duration::from_secs(5));
+        let input = PolicyDecisionInput {
+            room_id: RoomId::new(),
+            hand_id: HandId::new(),
+            seat_id: 1,
+            legal_actions: vec!["fold".to_string(), "call".to_string()],
+            public_state_json: serde_json::json!({"pot_total": 10}),
+            private_state_json: None,
+            decision_context_json: None,
+        };
+        eprintln!("=== codex cli connectivity test ===");
+        eprintln!(
+            "policy_input:\n{}",
+            serde_json::to_string_pretty(&input).expect("serialize input")
+        );
+
+        let decision = policy
+            .decide_action(&input)
+            .await
+            .expect("decision")
+            .expect("some");
+        eprintln!(
+            "policy_decision:\n{}",
+            serde_json::to_string_pretty(&decision).expect("serialize decision")
+        );
+        assert_eq!(decision.action_type, ActionType::Call);
+        assert_eq!(decision.source, PolicySource::Llm);
+        assert_eq!(decision.rationale.as_deref(), Some("mock_cli_ok"));
+    }
+
+    #[tokio::test]
+    async fn codex_cli_raw_stdio_output_is_visible_in_test_logs() {
+        let payload = serde_json::json!({
+            "task": "poker_action_decision",
+            "input": {
+                "legal_actions": ["fold", "call"]
+            }
+        });
+        let payload_text = payload.to_string();
+        let bin = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let mut child = tokio::process::Command::new(bin)
+            .args([
+                "-c",
+                "import json,sys; p=sys.stdin.read(); print('RAW_STDOUT_BEGIN'); print(p); print(json.dumps({'action_type':'call','amount':None,'rationale':'raw_stdio_ok'})); print('RAW_STDERR_BEGIN', file=sys.stderr)",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn mock cli");
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            stdin
+                .write_all(payload_text.as_bytes())
+                .await
+                .expect("write stdin");
+        }
+        let output = child.wait_with_output();
+
+        let output = tokio::time::timeout(Duration::from_secs(5), output)
+            .await
+            .expect("wait timeout")
+            .expect("wait output");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        eprintln!("=== raw cli stdio test ===");
+        eprintln!("raw_stdout:\n{stdout}");
+        eprintln!("raw_stderr:\n{stderr}");
+
+        let decision_line = stdout
+            .lines()
+            .rev()
+            .find(|line| line.contains("\"action_type\""))
+            .expect("decision json line");
+        let parsed: CodexDecisionRaw = serde_json::from_str(decision_line).expect("parse decision json");
+        assert_eq!(parsed.action_type, "call");
+        assert_eq!(parsed.rationale.as_deref(), Some("raw_stdio_ok"));
+        assert!(stderr.contains("RAW_STDERR_BEGIN"));
+        assert!(stdout.contains(&payload_text));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires real codex cli/auth/network; run manually"]
+    async fn codex_cli_real_decision_via_wrapper_must_not_fallback() {
+        let python_bin = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+        let wrapper_path = format!(
+            "{}/../../scripts/codex_decide_wrapper.py",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert!(
+            std::path::Path::new(&wrapper_path).exists(),
+            "wrapper not found: {wrapper_path}"
+        );
+
+        eprintln!("=== real codex decision test ===");
+        eprintln!("python_bin={python_bin}");
+        eprintln!("wrapper_path={wrapper_path}");
+        eprintln!(
+            "env CODEX_WRAPPER_CMD={}",
+            std::env::var("CODEX_WRAPPER_CMD").unwrap_or_else(|_| "<unset, default=codex>".to_string())
+        );
+        eprintln!(
+            "env CODEX_WRAPPER_ARGS={}",
+            std::env::var("CODEX_WRAPPER_ARGS").unwrap_or_else(|_| "<unset>".to_string())
+        );
+
+        let policy = CodexCliPolicyAdapter::new(
+            python_bin,
+            vec![wrapper_path],
+            Duration::from_secs(180),
+        );
+        let input = PolicyDecisionInput {
+            room_id: RoomId::new(),
+            hand_id: HandId::new(),
+            seat_id: 0,
+            legal_actions: vec!["fold".to_string(), "check".to_string(), "call".to_string()],
+            public_state_json: serde_json::json!({
+                "pot_total": 30,
+                "stack": 970,
+                "to_call": 10
+            }),
+            private_state_json: Some(serde_json::json!({
+                "decrypted_hole_cards": [{"cards":[1,3]}]
+            })),
+            decision_context_json: None,
+        };
+
+        eprintln!(
+            "policy_input:\n{}",
+            serde_json::to_string_pretty(&input).expect("serialize input")
+        );
+
+        let decision = policy
+            .decide_action(&input)
+            .await
+            .expect("real codex decision backend")
+            .expect("real codex decision output");
+
+        eprintln!(
+            "policy_decision:\n{}",
+            serde_json::to_string_pretty(&decision).expect("serialize decision")
+        );
+
+        let rationale = decision.rationale.clone().unwrap_or_default();
+        assert!(
+            rationale != "wrapper_fallback_rule" && rationale != "wrapper_invalid_input",
+            "wrapper fallback detected, real codex decision not observed: rationale={rationale}"
+        );
+        let action = format!("{:?}", decision.action_type).to_ascii_lowercase();
+        assert!(
+            input.legal_actions.iter().any(|a| a == &action),
+            "decision action not legal: {action}"
+        );
+    }
 }
