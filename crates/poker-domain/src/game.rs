@@ -34,6 +34,8 @@ pub struct HandSnapshot {
     pub hand_no: u64,
     pub status: HandStatus,
     pub street: Street,
+    #[serde(default)]
+    pub board_cards: Vec<u8>,
     pub acting_seat_id: Option<SeatId>,
     pub next_action_seq: ActionSeq,
     pub pot_total: Chips,

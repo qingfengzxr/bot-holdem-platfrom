@@ -183,6 +183,15 @@ fn pretty_hole_cards(decrypted_hole_cards: &[Value]) -> Vec<Vec<String>> {
         .collect::<Vec<_>>()
 }
 
+fn pretty_board_cards(board_cards: &[u8]) -> Vec<String> {
+    board_cards
+        .iter()
+        .copied()
+        .map(u64::from)
+        .filter_map(card_index_to_notation)
+        .collect::<Vec<_>>()
+}
+
 fn build_private_state_json(
     events: Vec<PrivatePayloadEvent>,
     card_encrypt_secret_hex: Option<&str>,
@@ -553,7 +562,15 @@ pub async fn collect_turn_decision_input(
             hand_id: state.hand_id,
             seat_id: cfg.seat_id,
             legal_actions,
-            public_state_json: serde_json::json!({}),
+            public_state_json: serde_json::json!({
+                "hand_status": state.status,
+                "street": state.street,
+                "acting_seat_id": state.acting_seat_id,
+                "next_action_seq": state.next_action_seq,
+                "pot_total": state.pot_total.as_u128(),
+                "board_cards_raw": state.board_cards,
+                "board_cards_pretty": pretty_board_cards(&state.board_cards),
+            }),
             private_state_json,
             decision_context_json,
         },

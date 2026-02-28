@@ -181,6 +181,7 @@ impl PokerEngine {
         state.hand.next_action_seq = 1;
         state.snapshot.status = HandStatus::Running;
         state.snapshot.street = Street::Preflop;
+        state.snapshot.board_cards.clear();
         state.hand.street = Street::Preflop;
         state.snapshot.acting_seat_id = Some(first_to_act);
         state.hand.acting_seat_id = Some(first_to_act);
@@ -523,6 +524,14 @@ impl PokerEngine {
         let Some(next_street) = next_street(state.snapshot.street) else {
             state.snapshot.status = HandStatus::Showdown;
             state.snapshot.street = Street::Showdown;
+            if let Some(dealing) = state.dealing.as_ref() {
+                state.snapshot.board_cards = dealing
+                    .board_cards
+                    .iter()
+                    .copied()
+                    .map(u8::from)
+                    .collect();
+            }
             state.hand.street = Street::Showdown;
             state.snapshot.acting_seat_id = None;
             state.hand.acting_seat_id = None;
@@ -531,6 +540,21 @@ impl PokerEngine {
         };
 
         state.snapshot.street = next_street;
+        if let Some(dealing) = state.dealing.as_ref() {
+            let reveal_count = match next_street {
+                Street::Preflop => 0,
+                Street::Flop => 3,
+                Street::Turn => 4,
+                Street::River | Street::Showdown => 5,
+            };
+            state.snapshot.board_cards = dealing
+                .board_cards
+                .iter()
+                .take(reveal_count)
+                .copied()
+                .map(u8::from)
+                .collect();
+        }
         state.hand.street = next_street;
         state.betting_round.current_bet = Chips::ZERO;
         state.betting_round.min_raise_to = None;

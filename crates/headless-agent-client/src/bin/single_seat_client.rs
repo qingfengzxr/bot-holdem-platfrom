@@ -402,6 +402,18 @@ where
             "received hole cards"
         );
     }
+    if let Some(board_cards) = turn
+        .policy_input
+        .public_state_json
+        .get("board_cards_pretty")
+    {
+        info!(
+            hand_id = %turn.hand_id.0,
+            action_seq = turn.action_seq,
+            board_cards_pretty = %board_cards,
+            "received public board cards"
+        );
+    }
 
     let decision = match policy_mode {
         PolicyMode::Rule => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),

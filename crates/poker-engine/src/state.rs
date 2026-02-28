@@ -70,6 +70,7 @@ impl EngineState {
                 hand_no,
                 status: HandStatus::Created,
                 street: Street::Preflop,
+                board_cards: Vec::new(),
                 acting_seat_id: None,
                 next_action_seq: 1_u32 as ActionSeq,
                 pot_total: Chips::ZERO,
