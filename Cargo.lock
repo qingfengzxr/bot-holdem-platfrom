@@ -1888,6 +1888,7 @@ name = "poker-engine"
 version = "0.1.0"
 dependencies = [
  "poker-domain",
+ "rand 0.8.5",
  "rs_poker",
  "thiserror 2.0.18",
 ]

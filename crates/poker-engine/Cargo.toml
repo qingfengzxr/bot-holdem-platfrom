@@ -9,5 +9,6 @@ workspace = true
 
 [dependencies]
 poker-domain = { path = "../poker-domain" }
+rand.workspace = true
 rs_poker.workspace = true
 thiserror.workspace = true

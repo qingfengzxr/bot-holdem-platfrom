@@ -2,6 +2,7 @@ use poker_domain::{
     ActionType, Chips, DomainError, HandEventKind, HandStatus, LegalAction, MoneyError,
     PlayerAction, SeatId, Street,
 };
+use rand::seq::SliceRandom;
 use rs_poker::core::{Card, Rankable};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -103,7 +104,9 @@ impl PokerEngine {
     }
 
     pub fn deal_new_hand_internal(&self, state: &mut EngineState) -> Result<(), EngineError> {
-        self.deal_new_hand_internal_with_deck(state, ordered_deck())
+        let mut deck = ordered_deck();
+        deck.shuffle(&mut rand::thread_rng());
+        self.deal_new_hand_internal_with_deck(state, deck)
     }
 
     pub fn deal_new_hand_internal_with_deck(
