@@ -230,6 +230,20 @@ fn pretty_hole_cards(private_state: &serde_json::Value) -> Option<Vec<Vec<String
     Some(out)
 }
 
+fn format_wei_as_eth(wei: u128) -> String {
+    const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+    let whole = wei / WEI_PER_ETH;
+    let frac = wei % WEI_PER_ETH;
+    if frac == 0 {
+        return format!("{whole}.0 ETH");
+    }
+    let mut frac_str = format!("{frac:018}");
+    while frac_str.ends_with('0') {
+        let _ = frac_str.pop();
+    }
+    format!("{whole}.{frac_str} ETH")
+}
+
 fn parse_x25519_secret_hex(secret_hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(secret_hex).with_context(|| "invalid CARD_ENCRYPT_SECRET_HEX")?;
     let arr: [u8; 32] = bytes
@@ -396,7 +410,7 @@ where
         hand_id = %turn.hand_id.0,
         action_seq = turn.action_seq,
         action_type = %format!("{:?}", decision.action_type).to_ascii_lowercase(),
-        amount = ?decision.amount.map(|v| v.as_u128()),
+        decision_amount = ?decision.amount.map(|v| v.as_u128()),
         rationale = ?decision.rationale,
         source = ?decision.source,
         "policy decision resolved"
@@ -425,6 +439,10 @@ where
             info!(
                 hand_id = %outcome.hand_id.0,
                 action_seq = outcome.action_seq,
+                submitted_amount_wei = ?outcome.submitted_amount.map(|v| v.as_u128()),
+                submitted_amount_eth = ?outcome
+                    .submitted_amount
+                    .map(|v| format_wei_as_eth(v.as_u128())),
                 tx_hash = ?outcome.tx_hash,
                 decision_source = ?decision.source,
                 "action submitted"

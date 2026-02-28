@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(360);
 const TURN_REMINDER_INTERVAL: Duration = Duration::from_secs(20);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_CHAIN_VERIFY_MIN_CONFIRMATIONS: u64 = 1;

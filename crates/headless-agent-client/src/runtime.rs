@@ -52,6 +52,7 @@ pub struct SingleActionRunnerConfig {
 pub struct SingleActionRunOutcome {
     pub hand_id: poker_domain::HandId,
     pub action_seq: u32,
+    pub submitted_amount: Option<Chips>,
     pub tx_hash: Option<String>,
 }
 
@@ -577,6 +578,7 @@ where
     Ok(SingleActionRunOutcome {
         hand_id: turn.hand_id,
         action_seq: turn.action_seq,
+        submitted_amount: resolved_amount,
         tx_hash,
     })
 }
