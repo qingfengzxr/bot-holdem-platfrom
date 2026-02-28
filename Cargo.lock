@@ -2878,6 +2878,7 @@ dependencies = [
 name = "table-service"
 version = "0.1.0"
 dependencies = [
+ "chain-watcher",
  "chrono",
  "hex",
  "poker-domain",

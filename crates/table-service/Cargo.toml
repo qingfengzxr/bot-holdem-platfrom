@@ -8,6 +8,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+chain-watcher = { path = "../chain-watcher" }
 chrono.workspace = true
 hex.workspace = true
 poker-domain = { path = "../poker-domain" }

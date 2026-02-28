@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chain_watcher::{EvmLikeTxRpcClient, ReqwestEvmJsonRpcClient};
 use chrono::Utc;
 use hex::FromHex;
 use poker_domain::{
@@ -17,6 +18,22 @@ use tracing::{debug, info, warn};
 const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_REMINDER_INTERVAL: Duration = Duration::from_secs(20);
 const SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_CHAIN_VERIFY_MIN_CONFIRMATIONS: u64 = 1;
+
+#[derive(Debug, Clone)]
+pub struct RoomActorConfig {
+    pub chain_verify_rpc_endpoint: Option<String>,
+    pub chain_verify_min_confirmations: u64,
+}
+
+impl Default for RoomActorConfig {
+    fn default() -> Self {
+        Self {
+            chain_verify_rpc_endpoint: None,
+            chain_verify_min_confirmations: DEFAULT_CHAIN_VERIFY_MIN_CONFIRMATIONS,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum RoomCommand {
@@ -397,12 +414,38 @@ pub fn spawn_room_actor_with_sink(
     queue_capacity: usize,
     event_sink: Arc<dyn RoomEventSink>,
 ) -> RoomHandle {
+    spawn_room_actor_with_sink_and_config(
+        room_id,
+        queue_capacity,
+        event_sink,
+        RoomActorConfig::default(),
+    )
+}
+
+pub fn spawn_room_actor_with_sink_and_config(
+    room_id: RoomId,
+    queue_capacity: usize,
+    event_sink: Arc<dyn RoomEventSink>,
+    config: RoomActorConfig,
+) -> RoomHandle {
     let (tx, mut rx) = mpsc::channel(queue_capacity);
     let handle_tx = tx.clone();
 
     tokio::spawn(async move {
         let actor_sender = tx.clone();
         spawn_scheduler_tick(actor_sender.clone());
+        let tx_verifier_client = config
+            .chain_verify_rpc_endpoint
+            .as_ref()
+            .map(|endpoint| ReqwestEvmJsonRpcClient::new(endpoint.clone()));
+        if let Some(endpoint) = config.chain_verify_rpc_endpoint.as_ref() {
+            info!(
+                room_id = %room_id.0,
+                chain_verify_rpc_endpoint = %endpoint,
+                chain_verify_min_confirmations = config.chain_verify_min_confirmations,
+                "room chain verification enabled"
+            );
+        }
         let engine = PokerEngine::new();
         let mut state = EngineState::new(room_id, 1);
         let mut seated: HashSet<SeatId> = HashSet::new();
@@ -831,6 +874,66 @@ pub fn spawn_room_actor_with_sink(
                                     pending_age_secs = age.as_secs(),
                                     "pending chain action still waiting for verification callback"
                                 );
+                            }
+                        }
+                    }
+                    if let Some(client) = tx_verifier_client.as_ref() {
+                        let pending_snapshot = pending_chain_actions
+                            .iter()
+                            .map(|(tx_hash, pending)| {
+                                (
+                                    tx_hash.clone(),
+                                    pending.action.hand_id,
+                                    pending.action.seat_id,
+                                    pending.action.action_seq,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        for (tx_hash, hand_id, seat_id, action_seq) in pending_snapshot {
+                            match client.get_tx(&tx_hash).await {
+                                Ok(None) => {}
+                                Ok(Some(observed)) => {
+                                    let (status, failure_reason) = if !observed.success {
+                                        ("failed".to_string(), Some("tx_failed".to_string()))
+                                    } else if observed.confirmations
+                                        < config.chain_verify_min_confirmations
+                                    {
+                                        ("pending".to_string(), None)
+                                    } else {
+                                        ("matched".to_string(), None)
+                                    };
+                                    if status != "pending" {
+                                        let callback = ChainTxVerifiedCallback {
+                                            tx_hash: tx_hash.clone(),
+                                            status: status.clone(),
+                                            confirmations: observed.confirmations,
+                                            hand_id: Some(hand_id),
+                                            seat_id: Some(seat_id),
+                                            action_seq: Some(action_seq),
+                                            failure_reason: failure_reason.clone(),
+                                        };
+                                        if actor_sender
+                                            .try_send(RoomCommand::ChainTxVerified { callback })
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                ?room_id,
+                                                tx_hash = %tx_hash,
+                                                status = %status,
+                                                "failed to enqueue chain verification callback"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        ?room_id,
+                                        tx_hash = %tx_hash,
+                                        error = %err,
+                                        "room chain verification query failed"
+                                    );
+                                }
                             }
                         }
                     }

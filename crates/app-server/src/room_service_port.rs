@@ -10,7 +10,10 @@ use rpc_gateway::{
     RoomReadyRequest, RoomServicePort, RoomSummary, RpcGatewayError,
     to_player_action,
 };
-use table_service::{NoopRoomEventSink, RoomEventSink, RoomHandle, spawn_room_actor_with_sink};
+use table_service::{
+    NoopRoomEventSink, RoomActorConfig, RoomEventSink, RoomHandle,
+    spawn_room_actor_with_sink_and_config,
+};
 use tracing::{debug, info, warn};
 
 use poker_domain::{HandSnapshot, LegalAction, RoomId, SeatId};
@@ -23,6 +26,7 @@ pub struct AppRoomService {
     bound_addresses: Arc<Mutex<HashMap<RoomId, HashMap<SeatId, String>>>>,
     event_sink: Arc<dyn RoomEventSink>,
     chain_tx_repo: Arc<dyn ChainTxRepository>,
+    room_actor_config: RoomActorConfig,
 }
 
 impl Default for AppRoomService {
@@ -40,6 +44,7 @@ impl AppRoomService {
             bound_addresses: Arc::default(),
             event_sink: Arc::new(NoopRoomEventSink),
             chain_tx_repo: Arc::new(NoopChainTxRepository),
+            room_actor_config: room_actor_config_from_env(),
         }
     }
 
@@ -51,6 +56,7 @@ impl AppRoomService {
             bound_addresses: Arc::default(),
             event_sink,
             chain_tx_repo: Arc::new(NoopChainTxRepository),
+            room_actor_config: room_actor_config_from_env(),
         }
     }
 
@@ -65,6 +71,7 @@ impl AppRoomService {
             bound_addresses: Arc::default(),
             event_sink,
             chain_tx_repo,
+            room_actor_config: room_actor_config_from_env(),
         }
     }
 
@@ -76,7 +83,12 @@ impl AppRoomService {
         if let Some(handle) = rooms.get(&room_id) {
             return Ok(handle.clone());
         }
-        let handle = spawn_room_actor_with_sink(room_id, 128, self.event_sink.clone());
+        let handle = spawn_room_actor_with_sink_and_config(
+            room_id,
+            128,
+            self.event_sink.clone(),
+            self.room_actor_config.clone(),
+        );
         rooms.insert(room_id, handle.clone());
         info!(room_id = %room_id.0, "room actor spawned");
         Ok(handle)
@@ -148,6 +160,21 @@ impl AppRoomService {
                 "seat {seat_id} must call room.join before bind/ready"
             )))
         }
+    }
+}
+
+fn room_actor_config_from_env() -> RoomActorConfig {
+    let chain_verify_rpc_endpoint = std::env::var("APP_SERVER__CHAIN_VERIFY_RPC_ENDPOINT")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let chain_verify_min_confirmations = std::env::var("APP_SERVER__CHAIN_VERIFY_MIN_CONFIRMATIONS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    RoomActorConfig {
+        chain_verify_rpc_endpoint,
+        chain_verify_min_confirmations,
     }
 }
 
