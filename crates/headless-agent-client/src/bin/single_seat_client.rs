@@ -7,7 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use headless_agent_client::runtime::{
-    SingleActionRunnerConfig, collect_turn_decision_input, execute_turn_decision, prepare_seat,
+    RuntimeError, SingleActionRunnerConfig, collect_turn_decision_input, execute_turn_decision,
+    prepare_seat,
 };
 use headless_agent_client::wallet_adapter::JsonRpcEvmWalletAdapter;
 use platform_core::ResponseEnvelope;
@@ -244,6 +245,14 @@ fn format_wei_as_eth(wei: u128) -> String {
     format!("{whole}.{frac_str} ETH")
 }
 
+fn payload_u64(payload: &serde_json::Value, key: &str) -> Option<u64> {
+    payload.get(key).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    })
+}
+
 fn parse_x25519_secret_hex(secret_hex: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(secret_hex).with_context(|| "invalid CARD_ENCRYPT_SECRET_HEX")?;
     let arr: [u8; 32] = bytes
@@ -373,6 +382,12 @@ where
 
     let turn_key = (turn.hand_id.0, turn.action_seq);
     if *last_attempted_turn == Some(turn_key) {
+        info!(
+            hand_id = %turn.hand_id.0,
+            action_seq = turn.action_seq,
+            seat_id = turn.policy_input.seat_id,
+            "skip duplicate turn attempt (already attempted this action_seq)"
+        );
         return Ok(());
     }
     if let Some(private_state) = turn.policy_input.private_state_json.as_ref()
@@ -439,17 +454,26 @@ where
             info!(
                 hand_id = %outcome.hand_id.0,
                 action_seq = outcome.action_seq,
+                action_type = %format!("{:?}", decision.action_type).to_ascii_lowercase(),
                 submitted_amount_wei = ?outcome.submitted_amount.map(|v| v.as_u128()),
                 submitted_amount_eth = ?outcome
                     .submitted_amount
                     .map(|v| format_wei_as_eth(v.as_u128())),
                 tx_hash = ?outcome.tx_hash,
                 decision_source = ?decision.source,
-                "action submitted"
+                "action decision submitted"
             );
         }
         Err(err) => {
             warn!(error = %err, "execute decision failed");
+            if matches!(err, RuntimeError::Http(_) | RuntimeError::Wallet(_)) {
+                *last_attempted_turn = None;
+                warn!(
+                    hand_id = %turn.hand_id.0,
+                    action_seq = turn.action_seq,
+                    "transient execution error, will retry on next event/poll"
+                );
+            }
         }
     }
 
@@ -650,6 +674,19 @@ async fn main() -> Result<()> {
                             let Ok(event) = serde_json::from_value::<EventEnvelope>(event_json.clone()) else {
                                 continue;
                             };
+                            info!(
+                                event_name = %event.event_name,
+                                topic = ?event.topic,
+                                room_id = %event.room_id.0,
+                                hand_id = ?event.hand_id.map(|v| v.0),
+                                envelope_seat_id = ?event.seat_id,
+                                payload_seat_id = ?payload_u64(&event.payload, "seat_id"),
+                                acting_seat_id = ?payload_u64(&event.payload, "acting_seat_id"),
+                                action_seq = ?payload_u64(&event.payload, "action_seq"),
+                                legal_actions = ?event.payload.get("legal_actions"),
+                                payload = %event.payload,
+                                "event notification received"
+                            );
                             if event.event_name == "turn_started" {
                                 info!(
                                     room_id = %event.room_id.0,
