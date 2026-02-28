@@ -231,6 +231,30 @@ fn pretty_hole_cards(private_state: &serde_json::Value) -> Option<Vec<Vec<String
     Some(out)
 }
 
+fn board_cards_pretty_from_raw(board_cards: &[u8]) -> Vec<String> {
+    board_cards
+        .iter()
+        .copied()
+        .map(u64::from)
+        .filter_map(card_index_to_notation)
+        .collect::<Vec<_>>()
+}
+
+fn notation_with_suit_symbols(card: &str) -> String {
+    if card.len() < 2 {
+        return card.to_string();
+    }
+    let (rank, suit) = card.split_at(card.len() - 1);
+    let suit_symbol = match suit {
+        "s" => "♠",
+        "c" => "♣",
+        "h" => "♥",
+        "d" => "♦",
+        _ => suit,
+    };
+    format!("{rank}{suit_symbol}")
+}
+
 fn format_wei_as_eth(wei: u128) -> String {
     const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
     let whole = wei / WEI_PER_ETH;
@@ -310,6 +334,11 @@ async fn poll_room_hand_state(
     };
 
     if last_observed.as_ref() != Some(&observed) {
+        let board_cards_pretty = board_cards_pretty_from_raw(&state.board_cards);
+        let board_cards_symbols = board_cards_pretty
+            .iter()
+            .map(|c| notation_with_suit_symbols(c))
+            .collect::<Vec<_>>();
         info!(
             room_id = %cfg.room_id.0,
             hand_id = %state.hand_id.0,
@@ -317,8 +346,11 @@ async fn poll_room_hand_state(
             street = ?state.street,
             acting_seat_id = ?state.acting_seat_id,
             action_seq = state.next_action_seq,
-            pot_total = state.pot_total.as_u128(),
+            pot_total_wei = state.pot_total.as_u128(),
+            pot_total_eth = %format_wei_as_eth(state.pot_total.as_u128()),
             board_cards_raw = ?state.board_cards,
+            board_cards_pretty = ?board_cards_pretty,
+            board_cards_symbols = ?board_cards_symbols,
             "room hand state polled"
         );
     }
@@ -530,7 +562,10 @@ where
         hand_id = %turn.hand_id.0,
         action_seq = turn.action_seq,
         action_type = %format!("{:?}", decision.action_type).to_ascii_lowercase(),
-        decision_amount = ?decision.amount.map(|v| v.as_u128()),
+        decision_amount_wei = ?decision.amount.map(|v| v.as_u128()),
+        decision_amount_eth = ?decision
+            .amount
+            .map(|v| format_wei_as_eth(v.as_u128())),
         rationale = ?decision.rationale,
         source = ?decision.source,
         "policy decision resolved"
