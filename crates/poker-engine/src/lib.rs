@@ -184,6 +184,31 @@ mod tests {
     }
 
     #[test]
+    fn new_hand_resets_hand_id_and_action_seq() {
+        let engine = PokerEngine::new();
+        let mut state = EngineState::new(RoomId::new(), 1);
+        state.seat_player(0);
+        state.seat_player(1);
+
+        engine
+            .deal_new_hand_internal(&mut state)
+            .expect("deal first hand");
+        let hand_id_1 = state.snapshot.hand_id;
+        state.snapshot.next_action_seq = 9;
+        state.hand.next_action_seq = 9;
+        state.snapshot.status = poker_domain::HandStatus::Settled;
+
+        engine
+            .deal_new_hand_internal(&mut state)
+            .expect("deal second hand");
+        let hand_id_2 = state.snapshot.hand_id;
+
+        assert_ne!(hand_id_1, hand_id_2);
+        assert_eq!(state.snapshot.next_action_seq, 1);
+        assert_eq!(state.hand.next_action_seq, 1);
+    }
+
+    #[test]
     fn blind_rotation_matrix_heads_up_continuous_hands() {
         assert_rotation_for_seat_count(2, 8);
     }

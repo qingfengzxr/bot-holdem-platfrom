@@ -512,22 +512,18 @@ fn resolve_action_amount_from_legal_actions(
     decision: &crate::policy_adapter::PolicyDecision,
     legal_actions_raw: &[LegalAction],
 ) -> Result<Option<Chips>, RuntimeError> {
-    if decision.amount.is_some() {
-        return Ok(decision.amount);
-    }
-
     match decision.action_type {
+        ActionType::Fold | ActionType::Check => Ok(None),
         ActionType::Call => {
             let call = legal_actions_raw
                 .iter()
                 .find(|a| a.action_type == ActionType::Call)
                 .ok_or_else(|| RuntimeError::Policy("call not present in legal actions".to_string()))?;
-            Ok(call.min_amount)
+            Ok(call.min_amount.or(decision.amount))
         }
-        ActionType::RaiseTo | ActionType::AllIn => Err(RuntimeError::Policy(
-            "raise_to/all_in requires explicit amount".to_string(),
-        )),
-        ActionType::Fold | ActionType::Check => Ok(None),
+        ActionType::RaiseTo | ActionType::AllIn => Ok(Some(decision.amount.ok_or(
+            RuntimeError::Policy("raise_to/all_in requires explicit amount".to_string()),
+        )?)),
     }
 }
 
@@ -675,5 +671,62 @@ mod tests {
         assert_eq!(state["decrypted_hole_cards"][0]["cards"][0], 7);
         assert_eq!(state["decrypted_hole_cards"][0]["cards"][1], 42);
         assert_eq!(state["decrypt_failures"], 0);
+    }
+
+    #[test]
+    fn resolve_amount_ignores_non_monetary_amounts_for_fold_and_check() {
+        let legal_actions = vec![
+            LegalAction {
+                action_type: ActionType::Fold,
+                min_amount: None,
+                max_amount: None,
+            },
+            LegalAction {
+                action_type: ActionType::Check,
+                min_amount: None,
+                max_amount: None,
+            },
+        ];
+        let fold = crate::policy_adapter::PolicyDecision {
+            action_type: ActionType::Fold,
+            amount: Some(Chips(0)),
+            rationale: None,
+            source: crate::policy_adapter::PolicySource::Llm,
+        };
+        let check = crate::policy_adapter::PolicyDecision {
+            action_type: ActionType::Check,
+            amount: Some(Chips(0)),
+            rationale: None,
+            source: crate::policy_adapter::PolicySource::Llm,
+        };
+
+        assert_eq!(
+            resolve_action_amount_from_legal_actions(&fold, &legal_actions).expect("fold amount"),
+            None
+        );
+        assert_eq!(
+            resolve_action_amount_from_legal_actions(&check, &legal_actions).expect("check amount"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_amount_uses_call_min_amount() {
+        let legal_actions = vec![LegalAction {
+            action_type: ActionType::Call,
+            min_amount: Some(Chips(200)),
+            max_amount: Some(Chips(200)),
+        }];
+        let call = crate::policy_adapter::PolicyDecision {
+            action_type: ActionType::Call,
+            amount: None,
+            rationale: None,
+            source: crate::policy_adapter::PolicySource::Llm,
+        };
+
+        assert_eq!(
+            resolve_action_amount_from_legal_actions(&call, &legal_actions).expect("call amount"),
+            Some(Chips(200))
+        );
     }
 }

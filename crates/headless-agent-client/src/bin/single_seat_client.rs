@@ -1,5 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
@@ -15,8 +16,12 @@ use headless_agent_client::policy_adapter::{
     RulePolicyAdapter,
 };
 use observability::init_tracing;
-use poker_domain::{Chips, RoomId};
-use rpc_gateway::{EventEnvelope, EventTopic, RoomListRequest, RoomSummary, SubscribeRequest};
+use poker_domain::{Chips, HandId, HandStatus, RoomId};
+use rpc_gateway::{
+    EventEnvelope, EventTopic, GameGetPrivatePayloadsRequest, GameGetStateRequest,
+    PrivatePayloadEvent, RoomListRequest, RoomSummary, SubscribeRequest,
+};
+use seat_crypto::{HoleCardsDealtCipherPayload, decrypt_with_recipient_x25519};
 use tokio::net::TcpStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -223,6 +228,116 @@ fn pretty_hole_cards(private_state: &serde_json::Value) -> Option<Vec<Vec<String
         out.push(pair);
     }
     Some(out)
+}
+
+fn parse_x25519_secret_hex(secret_hex: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(secret_hex).with_context(|| "invalid CARD_ENCRYPT_SECRET_HEX")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("CARD_ENCRYPT_SECRET_HEX must decode to 32 bytes"))?;
+    Ok(arr)
+}
+
+fn envelope_ok<T>(env: ResponseEnvelope<T>, method: &str) -> Result<T> {
+    if !env.ok {
+        let msg = env
+            .error
+            .map(|e| format!("{:?}: {}", e.code, e.message))
+            .unwrap_or_else(|| "unknown app error".to_string());
+        bail!("{method} failed: {msg}");
+    }
+    env.data
+        .ok_or_else(|| anyhow::anyhow!("{method} missing data payload"))
+}
+
+async fn sync_hole_cards_for_hand(
+    cfg: &SingleActionRunnerConfig,
+    hand_id: HandId,
+    synced_hands: &mut HashSet<Uuid>,
+) -> Result<()> {
+    if synced_hands.contains(&hand_id.0) {
+        return Ok(());
+    }
+    let Some(secret_hex) = cfg.card_encrypt_secret_hex.as_deref() else {
+        return Ok(());
+    };
+    let secret = parse_x25519_secret_hex(secret_hex)?;
+    let private_req = GameGetPrivatePayloadsRequest {
+        room_id: cfg.room_id,
+        seat_id: cfg.seat_id,
+        hand_id: Some(hand_id),
+    };
+    let private_env: ResponseEnvelope<Vec<PrivatePayloadEvent>> = http_rpc_call(
+        &cfg.rpc_endpoint,
+        "game.get_private_payloads",
+        serde_json::to_value(private_req).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    )
+    .await?;
+    let events = envelope_ok(private_env, "game.get_private_payloads")?;
+    let mut decrypted_hole_cards: Vec<serde_json::Value> = Vec::new();
+    for event in events {
+        if event.event_name != "hole_cards_dealt" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_value::<HoleCardsDealtCipherPayload>(event.payload) else {
+            continue;
+        };
+        let Ok(plaintext) = decrypt_with_recipient_x25519(&secret, &payload.aad, &payload.envelope)
+        else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&plaintext) else {
+            continue;
+        };
+        decrypted_hole_cards.push(v);
+    }
+    if decrypted_hole_cards.is_empty() {
+        return Ok(());
+    }
+    let private_state = serde_json::json!({
+        "decrypted_hole_cards": decrypted_hole_cards,
+    });
+    let Some(cards_raw) = private_state.get("decrypted_hole_cards") else {
+        return Ok(());
+    };
+    let pretty_cards = pretty_hole_cards(&private_state);
+    info!(
+        hand_id = %hand_id.0,
+        seat_id = cfg.seat_id,
+        hole_cards_raw = %cards_raw,
+        hole_cards_pretty = ?pretty_cards,
+        "hole cards synced on hand start"
+    );
+    synced_hands.insert(hand_id.0);
+    Ok(())
+}
+
+async fn sync_hole_cards_for_current_hand(
+    cfg: &SingleActionRunnerConfig,
+    synced_hands: &mut HashSet<Uuid>,
+) -> Result<()> {
+    let state_req = GameGetStateRequest {
+        room_id: cfg.room_id,
+        hand_id: None,
+        seat_id: Some(cfg.seat_id),
+    };
+    let state_env: ResponseEnvelope<Option<poker_domain::HandSnapshot>> = http_rpc_call(
+        &cfg.rpc_endpoint,
+        "game.get_state",
+        serde_json::to_value(state_req).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    )
+    .await?;
+    let state = envelope_ok(state_env, "game.get_state")?;
+    let Some(state) = state else {
+        return Ok(());
+    };
+    if !matches!(
+        state.status,
+        HandStatus::Running | HandStatus::Showdown | HandStatus::Settling
+    ) {
+        return Ok(());
+    }
+    sync_hole_cards_for_hand(cfg, state.hand_id, synced_hands).await
 }
 
 async fn maybe_execute_turn<W>(
@@ -432,6 +547,7 @@ async fn main() -> Result<()> {
 
     let mut decision_ctx = DecisionContextManager::with_max_entries(context_max_entries);
     let mut last_attempted_turn: Option<(Uuid, u32)> = None;
+    let mut synced_hands: HashSet<Uuid> = HashSet::new();
     let codex_policy = CodexCliPolicyAdapter::new(
         codex_cli_bin,
         codex_cli_args,
@@ -463,6 +579,9 @@ async fn main() -> Result<()> {
             }
         };
         info!(subscription_id = %subscription_id, "subscribed to turn events");
+        if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
+            warn!(error = %err, "sync hole cards for current hand failed");
+        }
 
         let _ = maybe_execute_turn(
             &cfg,
@@ -520,6 +639,13 @@ async fn main() -> Result<()> {
                                     seat_id = ?event.seat_id,
                                     "turn started event received"
                                 );
+                            }
+                            if matches!(event.event_name.as_str(), "hand_started" | "turn_started")
+                                && let Some(hand_id) = event.hand_id
+                                && let Err(err) =
+                                    sync_hole_cards_for_hand(&cfg, hand_id, &mut synced_hands).await
+                            {
+                                warn!(error = %err, hand_id = %hand_id.0, "sync hole cards for hand failed");
                             }
                             if event.event_name == "hand_closed" {
                                 info!(

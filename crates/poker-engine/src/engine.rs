@@ -133,6 +133,7 @@ impl PokerEngine {
         }
 
         let mut iter = deck.into_iter();
+        let new_hand_id = poker_domain::HandId::new();
         let mut hole_cards: HashMap<SeatId, [Card; 2]> = HashMap::new();
         for _round in 0..2 {
             for seat in &seats {
@@ -171,6 +172,10 @@ impl PokerEngine {
             .blinds_and_first_to_act(state, &seats)
             .ok_or(EngineError::NotEnoughPlayersToDeal)?;
 
+        state.snapshot.hand_id = new_hand_id;
+        state.hand.hand_id = new_hand_id;
+        state.snapshot.next_action_seq = 1;
+        state.hand.next_action_seq = 1;
         state.snapshot.status = HandStatus::Running;
         state.snapshot.street = Street::Preflop;
         state.hand.street = Street::Preflop;
