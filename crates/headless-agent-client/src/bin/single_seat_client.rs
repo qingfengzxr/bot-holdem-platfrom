@@ -273,6 +273,99 @@ fn envelope_ok<T>(env: ResponseEnvelope<T>, method: &str) -> Result<T> {
         .ok_or_else(|| anyhow::anyhow!("{method} missing data payload"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedHandState {
+    hand_id: Uuid,
+    status: HandStatus,
+    acting_seat_id: Option<u8>,
+    action_seq: u32,
+}
+
+async fn poll_room_hand_state(
+    cfg: &SingleActionRunnerConfig,
+    wallet: &JsonRpcEvmWalletAdapter,
+    last_observed: &mut Option<ObservedHandState>,
+    last_attempted_turn: &mut Option<(Uuid, u32)>,
+) -> Result<()> {
+    let req = GameGetStateRequest {
+        room_id: cfg.room_id,
+        hand_id: None,
+        seat_id: Some(cfg.seat_id),
+    };
+    let env: ResponseEnvelope<Option<poker_domain::HandSnapshot>> = http_rpc_call(
+        &cfg.rpc_endpoint,
+        "game.get_state",
+        serde_json::to_value(req).map_err(|e| anyhow::anyhow!(e.to_string()))?,
+    )
+    .await?;
+    let Some(state) = envelope_ok(env, "game.get_state")? else {
+        return Ok(());
+    };
+
+    let observed = ObservedHandState {
+        hand_id: state.hand_id.0,
+        status: state.status,
+        acting_seat_id: state.acting_seat_id,
+        action_seq: state.next_action_seq,
+    };
+
+    if last_observed.as_ref() != Some(&observed) {
+        info!(
+            room_id = %cfg.room_id.0,
+            hand_id = %state.hand_id.0,
+            status = ?state.status,
+            street = ?state.street,
+            acting_seat_id = ?state.acting_seat_id,
+            action_seq = state.next_action_seq,
+            pot_total = state.pot_total.as_u128(),
+            board_cards_raw = ?state.board_cards,
+            "room hand state polled"
+        );
+    }
+
+    if let Some(prev) = last_observed.as_ref()
+        && prev.hand_id != observed.hand_id
+    {
+        *last_attempted_turn = None;
+        info!(
+            room_id = %cfg.room_id.0,
+            prev_hand_id = %prev.hand_id,
+            new_hand_id = %observed.hand_id,
+            "new hand detected by polling, cleared last attempted turn"
+        );
+    }
+
+    if matches!(observed.status, HandStatus::Settled | HandStatus::Aborted)
+        && !matches!(
+            last_observed.as_ref().map(|v| v.status),
+            Some(HandStatus::Settled | HandStatus::Aborted)
+        )
+    {
+        info!(
+            room_id = %cfg.room_id.0,
+            hand_id = %observed.hand_id,
+            final_status = ?observed.status,
+            "hand closed notification observed by polling (broadcast to all seats)"
+        );
+        match prepare_seat(cfg.clone(), wallet).await {
+            Ok(_) => info!(
+                room_id = %cfg.room_id.0,
+                seat_id = cfg.seat_id,
+                "hand ended, seat auto-re-prepare completed (join/bind/ready retried)"
+            ),
+            Err(err) => warn!(
+                room_id = %cfg.room_id.0,
+                seat_id = cfg.seat_id,
+                error = %err,
+                "hand ended, seat auto-re-prepare failed"
+            ),
+        }
+    }
+
+    *last_observed = Some(observed);
+    Ok(())
+}
+
 async fn sync_hole_cards_for_hand(
     cfg: &SingleActionRunnerConfig,
     hand_id: HandId,
@@ -604,6 +697,7 @@ async fn main() -> Result<()> {
 
     let mut decision_ctx = DecisionContextManager::with_max_entries(context_max_entries);
     let mut last_attempted_turn: Option<(Uuid, u32)> = None;
+    let mut last_observed_hand_state: Option<ObservedHandState> = None;
     let mut synced_hands: HashSet<Uuid> = HashSet::new();
     let codex_policy = CodexCliPolicyAdapter::new(
         codex_cli_bin,
@@ -667,6 +761,17 @@ async fn main() -> Result<()> {
         if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
             warn!(error = %err, "sync hole cards for current hand failed");
         }
+        if let Err(err) =
+            poll_room_hand_state(
+                &cfg,
+                &wallet,
+                &mut last_observed_hand_state,
+                &mut last_attempted_turn,
+            )
+                .await
+        {
+            warn!(error = %err, "initial room state poll failed");
+        }
 
         let _ = maybe_execute_turn(
             &cfg,
@@ -687,6 +792,14 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 _ = safety_ticker.tick() => {
+                    if let Err(err) = poll_room_hand_state(
+                        &cfg,
+                        &wallet,
+                        &mut last_observed_hand_state,
+                        &mut last_attempted_turn,
+                    ).await {
+                        warn!(error = %err, "safety poll room state failed");
+                    }
                     if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
                         warn!(error = %err, "safety poll hole cards sync failed");
                     }
@@ -753,9 +866,18 @@ async fn main() -> Result<()> {
                             }
                             if event.event_name == "hand_closed" {
                                 info!(
+                                    room_id = %event.room_id.0,
                                     hand_id = ?event.hand_id.map(|v| v.0),
-                                    "hand closed event received"
+                                    "hand closed event received (broadcast notification)"
                                 );
+                                if let Err(err) = poll_room_hand_state(
+                                    &cfg,
+                                    &wallet,
+                                    &mut last_observed_hand_state,
+                                    &mut last_attempted_turn,
+                                ).await {
+                                    warn!(error = %err, "room state poll after hand_closed failed");
+                                }
                             }
                             if event.event_name != "turn_started" {
                                 continue;
