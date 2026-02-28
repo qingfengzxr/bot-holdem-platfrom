@@ -192,7 +192,7 @@ impl PolicyAdapter for CodexCliPolicyAdapter {
     ) -> Result<Option<PolicyDecision>, PolicyAdapterError> {
         let prompt = serde_json::json!({
             "task": "poker_action_decision",
-            "instruction": "Choose exactly one legal action. Output ONLY JSON: {\"action_type\":\"fold|check|call|raise_to|all_in\",\"amount\":\"u128 string or null\",\"rationale\":\"short\"}",
+            "instruction": "Choose exactly one legal action. private_state_json.decrypted_hole_cards_pretty uses human-readable cards (e.g. As, Td); if unavailable, decode decrypted_hole_cards via private_state_json.card_index_encoding. Output ONLY JSON: {\"action_type\":\"fold|check|call|raise_to|all_in\",\"amount\":\"u128 string or null\",\"rationale\":\"short\"}",
             "input": input,
         })
         .to_string();

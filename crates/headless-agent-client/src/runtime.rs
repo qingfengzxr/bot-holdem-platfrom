@@ -138,6 +138,51 @@ fn parse_x25519_secret_hex(secret_hex: &str) -> Result<[u8; 32], RuntimeError> {
     Ok(arr)
 }
 
+fn card_index_to_notation(index: u64) -> Option<String> {
+    if index >= 52 {
+        return None;
+    }
+    let value = match index % 13 {
+        0 => "2",
+        1 => "3",
+        2 => "4",
+        3 => "5",
+        4 => "6",
+        5 => "7",
+        6 => "8",
+        7 => "9",
+        8 => "T",
+        9 => "J",
+        10 => "Q",
+        11 => "K",
+        12 => "A",
+        _ => return None,
+    };
+    let suit = match index / 13 {
+        0 => "s",
+        1 => "c",
+        2 => "h",
+        3 => "d",
+        _ => return None,
+    };
+    Some(format!("{value}{suit}"))
+}
+
+fn pretty_hole_cards(decrypted_hole_cards: &[Value]) -> Vec<Vec<String>> {
+    decrypted_hole_cards
+        .iter()
+        .filter_map(|entry| entry.get("cards").and_then(Value::as_array))
+        .map(|cards| {
+            cards
+                .iter()
+                .filter_map(|c| c.as_u64())
+                .filter_map(card_index_to_notation)
+                .collect::<Vec<_>>()
+        })
+        .filter(|cards| !cards.is_empty())
+        .collect::<Vec<_>>()
+}
+
 fn build_private_state_json(
     events: Vec<PrivatePayloadEvent>,
     card_encrypt_secret_hex: Option<&str>,
@@ -173,9 +218,18 @@ fn build_private_state_json(
         }
     }
 
+    let decrypted_hole_cards_pretty = pretty_hole_cards(&decrypted_hole_cards);
+
     Ok(Some(serde_json::json!({
         "events": events,
         "decrypted_hole_cards": decrypted_hole_cards,
+        "decrypted_hole_cards_pretty": decrypted_hole_cards_pretty,
+        "card_index_encoding": {
+            "description": "Card index to notation mapping for decrypted_hole_cards[*].cards[*]",
+            "formula": "index = suit_bucket * 13 + rank_offset",
+            "rank_offset_map": ["2","3","4","5","6","7","8","9","T","J","Q","K","A"],
+            "suit_bucket_map": ["s","c","h","d"]
+        },
         "decrypt_failures": decrypt_failures,
     })))
 }
@@ -642,6 +696,11 @@ mod tests {
             .expect("some");
         assert_eq!(state["events"].as_array().map_or(0, Vec::len), 1);
         assert_eq!(state["decrypted_hole_cards"].as_array().map_or(0, Vec::len), 0);
+        assert_eq!(
+            state["decrypted_hole_cards_pretty"].as_array().map_or(0, Vec::len),
+            0
+        );
+        assert_eq!(state["card_index_encoding"]["suit_bucket_map"][0], "s");
     }
 
     #[test]
@@ -672,6 +731,8 @@ mod tests {
             .expect("some");
         assert_eq!(state["decrypted_hole_cards"][0]["cards"][0], 7);
         assert_eq!(state["decrypted_hole_cards"][0]["cards"][1], 42);
+        assert_eq!(state["decrypted_hole_cards_pretty"][0][0], "9s");
+        assert_eq!(state["decrypted_hole_cards_pretty"][0][1], "5d");
         assert_eq!(state["decrypt_failures"], 0);
     }
 

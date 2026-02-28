@@ -487,19 +487,22 @@ async fn connect_ws(ws_endpoint: &str) -> Result<WsStream> {
     Ok(stream)
 }
 
-async fn subscribe_turn_events(
+async fn subscribe_events(
     ws_stream: &mut WsStream,
     cfg: &SingleActionRunnerConfig,
+    topic: EventTopic,
+    seat_id: Option<u8>,
+    request_id: u64,
 ) -> Result<String> {
     let subscribe_req = SubscribeRequest {
-        topic: EventTopic::HandEvents,
+        topic,
         room_id: cfg.room_id,
         hand_id: None,
-        seat_id: None,
+        seat_id,
     };
     let req = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": 1_u64,
+        "id": request_id,
         "method": "subscribe.events.native",
         "params": subscribe_req,
     });
@@ -515,7 +518,7 @@ async fn subscribe_turn_events(
         }
         let value: serde_json::Value = serde_json::from_str(msg.to_text().unwrap_or_default())
             .context("invalid websocket json frame")?;
-        if value.get("id") != Some(&serde_json::json!(1_u64)) {
+        if value.get("id") != Some(&serde_json::json!(request_id)) {
             continue;
         }
         if let Some(err) = value.get("error") {
@@ -612,7 +615,15 @@ async fn main() -> Result<()> {
             }
         };
 
-        let subscription_id = match subscribe_turn_events(&mut ws_stream, &cfg).await {
+        let hand_subscription_id = match subscribe_events(
+            &mut ws_stream,
+            &cfg,
+            EventTopic::HandEvents,
+            None,
+            1,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 warn!(error = %err, "subscribe events failed");
@@ -620,7 +631,27 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
-        info!(subscription_id = %subscription_id, "subscribed to turn events");
+        let seat_subscription_id = match subscribe_events(
+            &mut ws_stream,
+            &cfg,
+            EventTopic::SeatEvents,
+            Some(cfg.seat_id),
+            2,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(error = %err, "subscribe seat events failed");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        info!(
+            hand_subscription_id = %hand_subscription_id,
+            seat_subscription_id = %seat_subscription_id,
+            "subscribed to hand and seat events"
+        );
         if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
             warn!(error = %err, "sync hole cards for current hand failed");
         }
@@ -644,6 +675,9 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
                 _ = safety_ticker.tick() => {
+                    if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
+                        warn!(error = %err, "safety poll hole cards sync failed");
+                    }
                     if let Err(err) = maybe_execute_turn(
                         &cfg,
                         &wallet,
@@ -695,7 +729,10 @@ async fn main() -> Result<()> {
                                     "turn started event received"
                                 );
                             }
-                            if matches!(event.event_name.as_str(), "hand_started" | "turn_started")
+                            if matches!(
+                                event.event_name.as_str(),
+                                "hand_started" | "turn_started" | "hole_cards_dealt"
+                            )
                                 && let Some(hand_id) = event.hand_id
                                 && let Err(err) =
                                     sync_hole_cards_for_hand(&cfg, hand_id, &mut synced_hands).await

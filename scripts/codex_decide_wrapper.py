@@ -80,7 +80,10 @@ def _build_codex_prompt(payload: Dict[str, Any]) -> str:
             "task": "poker_action_decision",
             "instruction": (
                 "Return ONLY JSON with fields action_type, amount, rationale. "
-                "action_type must be one of legal_actions."
+                "action_type must be one of legal_actions. "
+                "If private_state_json.decrypted_hole_cards_pretty exists, use it as canonical cards "
+                "(e.g. As, Td). If only private_state_json.decrypted_hole_cards exists, decode using "
+                "private_state_json.card_index_encoding."
             ),
             "input": payload.get("input", payload),
         },
