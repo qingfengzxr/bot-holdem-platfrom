@@ -583,6 +583,13 @@ pub fn spawn_room_actor_with_sink_and_config(
                                     },
                                 ),
                             ];
+                            info!(
+                                room_id = %room_id.0,
+                                hand_id = %state.snapshot.hand_id.0,
+                                acting_seat_id = ?state.snapshot.acting_seat_id,
+                                action_seq = state.snapshot.next_action_seq,
+                                "turn notification emitted: initial hand turn started"
+                            );
                             let _ = event_sink.append_hand_events(&hand_events);
                             timeout_generation = timeout_generation.saturating_add(1);
                             turn_scheduler = None;
@@ -688,12 +695,22 @@ pub fn spawn_room_actor_with_sink_and_config(
                             action_seq = submitted_action.action_seq,
                             action_type = %format!("{:?}", submitted_action.action_type).to_ascii_lowercase(),
                             tx_hash = %callback.tx_hash,
-                            "pending action applied"
+                            confirmations = callback.confirmations,
+                            "pending action verification matched"
                         );
                         let result = engine
                             .apply_action(&mut state, pending.action)
                             .map_err(|err| err.to_string());
                         if let Ok(engine_result) = result.as_ref() {
+                            info!(
+                                ?room_id,
+                                hand_id = %submitted_action.hand_id.0,
+                                seat_id = submitted_action.seat_id,
+                                action_seq = submitted_action.action_seq,
+                                action_type = %format!("{:?}", submitted_action.action_type).to_ascii_lowercase(),
+                                tx_hash = %callback.tx_hash,
+                                "pending action applied to game state"
+                            );
                             emit_post_action_hand_events(
                                 &*event_sink,
                                 room_id,
@@ -704,7 +721,29 @@ pub fn spawn_room_actor_with_sink_and_config(
                                 &mut timeout_generation,
                             );
                             turn_scheduler = None;
+                        } else if let Err(err) = result {
+                            warn!(
+                                ?room_id,
+                                hand_id = %submitted_action.hand_id.0,
+                                seat_id = submitted_action.seat_id,
+                                action_seq = submitted_action.action_seq,
+                                tx_hash = %callback.tx_hash,
+                                error = %err,
+                                current_acting_seat_id = ?state.snapshot.acting_seat_id,
+                                current_action_seq = state.snapshot.next_action_seq,
+                                "pending action verified but apply_action failed"
+                            );
                         }
+                    } else if callback.status == "matched"
+                        && callback.hand_id == Some(state.snapshot.hand_id)
+                    {
+                        warn!(
+                            ?room_id,
+                            tx_hash = %callback.tx_hash,
+                            hand_id = %state.snapshot.hand_id.0,
+                            current_action_seq = state.snapshot.next_action_seq,
+                            "matched callback received but pending action not found"
+                        );
                     }
                     if matches!(callback.status.as_str(), "failed" | "unmatched")
                         && callback.hand_id == Some(state.snapshot.hand_id)
@@ -1043,6 +1082,13 @@ pub fn spawn_room_actor_with_sink_and_config(
                             action_seq,
                             "turn reminder elapsed, notifying acting seat"
                         );
+                        info!(
+                            room_id = %room_id.0,
+                            hand_id = %hand_id.0,
+                            acting_seat_id,
+                            action_seq,
+                            "turn notification emitted: reminder rebroadcast"
+                        );
                         let _ = event_sink.append_hand_events(&[new_hand_event(
                             room_id,
                             hand_id,
@@ -1096,6 +1142,8 @@ fn emit_post_action_hand_events(
     next_hand_event_seq: &mut u32,
     timeout_generation: &mut u64,
 ) {
+    let submitted_action_type = format!("{:?}", submitted_action.action_type).to_ascii_lowercase();
+    let submitted_action_seat_id = submitted_action.seat_id;
     let mut hand_events = vec![
         new_hand_event(
             room_id,
@@ -1124,6 +1172,15 @@ fn emit_post_action_hand_events(
     }
 
     if let Some(next_seat_id) = state.snapshot.acting_seat_id {
+        info!(
+            room_id = %room_id.0,
+            hand_id = %state.snapshot.hand_id.0,
+            from_seat_id = submitted_action_seat_id,
+            next_seat_id,
+            next_action_seq = state.snapshot.next_action_seq,
+            action_type = %submitted_action_type,
+            "turn notification emitted: next acting seat"
+        );
         hand_events.push(new_hand_event(
             room_id,
             state.snapshot.hand_id,
@@ -1137,6 +1194,12 @@ fn emit_post_action_hand_events(
         state.snapshot.status,
         HandStatus::Settled | HandStatus::Aborted
     ) {
+        info!(
+            room_id = %room_id.0,
+            hand_id = %state.snapshot.hand_id.0,
+            final_status = ?state.snapshot.status,
+            "hand notification emitted: hand closed"
+        );
         hand_events.push(new_hand_event(
             room_id,
             state.snapshot.hand_id,

@@ -219,7 +219,14 @@ where
         },
     };
     let Some(decision) = decision else {
-        warn!("no policy decision available");
+        warn!(
+            hand_id = %turn.hand_id.0,
+            action_seq = turn.action_seq,
+            seat_id = turn.policy_input.seat_id,
+            legal_actions = ?turn.policy_input.legal_actions,
+            policy_mode = ?policy_mode,
+            "no policy decision available"
+        );
         return Ok(());
     };
     info!(
