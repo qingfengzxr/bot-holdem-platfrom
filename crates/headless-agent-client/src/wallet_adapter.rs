@@ -197,7 +197,8 @@ impl WalletAdapter for JsonRpcEvmWalletAdapter {
         message: &[u8],
     ) -> Result<String, WalletAdapterError> {
         let data = format!("0x{}", hex::encode(message));
-        self.rpc_call("personal_sign", serde_json::json!([data, from])).await
+        self.rpc_call("personal_sign", serde_json::json!([data, from]))
+            .await
     }
 }
 

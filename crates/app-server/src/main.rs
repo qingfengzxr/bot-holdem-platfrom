@@ -5,6 +5,7 @@ mod data_layer_consistency;
 mod integration_flows;
 mod outbox_publisher;
 mod room_service_port;
+mod room_settlement_wallet_adapter;
 mod rpc_reject_audit_sink;
 mod rpc_request_signature_verifier;
 mod seat_crypto_audit_sink;
@@ -22,26 +23,26 @@ use audit_store::{
 };
 use auto_settlement::{
     AppRoomShowdownInputProvider, AutoSettlementLoopConfig, spawn_auto_settlement_loop,
-    spawn_auto_settlement_loop_with_batch,
+    spawn_auto_settlement_loop_with_batch, spawn_auto_settlement_loop_without_wallet,
 };
+use jsonrpsee::server::ServerBuilder;
 use ledger_store::{
     ChainTxRepository, LedgerRepository, NoopChainTxRepository, NoopLedgerRepository,
     PostgresChainTxRepository, PostgresLedgerRepository,
 };
-use jsonrpsee::server::ServerBuilder;
 use observability::init_tracing;
 use ops_http::{InMemoryRoomAdminReadRepository, OpsState, PostgresRoomAdminReadRepository};
 use platform_core::AppConfig;
 use poker_domain::RoomId;
 use poker_engine::PokerEngine;
 use room_service_port::AppRoomService;
+use room_settlement_wallet_adapter::{
+    RoomScopedRawTxBatchSettlementWalletAdapter, RoomScopedRawTxSettlementWalletAdapter,
+};
 use rpc_gateway::{InMemoryEventBus, RpcGateway, RpcGatewayLimits};
 use rpc_reject_audit_sink::AuditRpcRejectSink;
 use rpc_request_signature_verifier::AppRpcRequestSignatureVerifier;
-use settlement::{
-    BatchSettlementWalletAdapter, ReqwestEvmBatchSettlementWalletAdapter,
-    ReqwestEvmSettlementWalletAdapter, SettlementWalletAdapter,
-};
+use settlement::{BatchSettlementWalletAdapter, SettlementWalletAdapter};
 use showdown_admin_repo::AppShowdownAdminRepository;
 use sqlx::postgres::PgPoolOptions;
 use std::{env, sync::Arc, time::Duration};
@@ -257,34 +258,35 @@ fn auto_settlement_enabled_from_env() -> bool {
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "on" | "yes"
         ),
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
-fn build_settlement_wallet_adapter_from_env() -> Option<Arc<dyn SettlementWalletAdapter>> {
+fn build_settlement_wallet_adapter_from_env(
+    room_service: AppRoomService,
+) -> Option<Arc<dyn SettlementWalletAdapter>> {
     let endpoint = env::var("SETTLEMENT_EVM_RPC_URL").ok()?;
-    let from_address = env::var("SETTLEMENT_FROM_ADDRESS").ok()?;
-    if endpoint.trim().is_empty() || from_address.trim().is_empty() {
+    if endpoint.trim().is_empty() {
         return None;
     }
-    Some(Arc::new(ReqwestEvmSettlementWalletAdapter::new(
+    Some(Arc::new(RoomScopedRawTxSettlementWalletAdapter::new(
         endpoint,
-        from_address,
+        room_service,
     )))
 }
 
-fn build_batch_settlement_wallet_adapter_from_env() -> Option<Arc<dyn BatchSettlementWalletAdapter>>
-{
+fn build_batch_settlement_wallet_adapter_from_env(
+    room_service: AppRoomService,
+) -> Option<Arc<dyn BatchSettlementWalletAdapter>> {
     let endpoint = env::var("SETTLEMENT_EVM_RPC_URL").ok()?;
-    let from_address = env::var("SETTLEMENT_FROM_ADDRESS").ok()?;
     let contract = env::var("SETTLEMENT_BATCH_CONTRACT_ADDRESS").ok()?;
-    if endpoint.trim().is_empty() || from_address.trim().is_empty() || contract.trim().is_empty() {
+    if endpoint.trim().is_empty() || contract.trim().is_empty() {
         return None;
     }
-    Some(Arc::new(ReqwestEvmBatchSettlementWalletAdapter::new(
+    Some(Arc::new(RoomScopedRawTxBatchSettlementWalletAdapter::new(
         endpoint,
-        from_address,
         contract,
+        room_service,
     )))
 }
 
@@ -326,8 +328,14 @@ async fn main() -> Result<()> {
     );
     let audit_repo = repo_bundle.audit_repo.clone();
     let chain_tx_repo = repo_bundle.chain_tx_repo.clone();
-    let room_event_sink = Arc::new(AuditRoomEventSink::new(audit_repo.clone()));
-    let room_service = AppRoomService::with_sinks(room_event_sink, chain_tx_repo.clone());
+    let room_event_sink = Arc::new(
+        AuditRoomEventSink::new(audit_repo.clone()).with_db_pool(repo_bundle.db_pool.clone()),
+    );
+    let room_service = AppRoomService::with_sinks_and_pool(
+        room_event_sink,
+        chain_tx_repo.clone(),
+        repo_bundle.db_pool.clone(),
+    );
     let event_bus = Arc::new(InMemoryEventBus::new());
     let rpc_reject_audit_sink = Arc::new(AuditRpcRejectSink::new(repo_bundle.audit_repo.clone()));
     let rpc_request_signature_verifier =
@@ -383,8 +391,9 @@ async fn main() -> Result<()> {
     let rpc_local_addr = rpc_server.local_addr()?;
     let rpc_handle = rpc_server.start(rpc_module);
     info!(rpc_addr = %rpc_local_addr, "json-rpc server started");
-    let _settlement_wallet_adapter = build_settlement_wallet_adapter_from_env();
-    let _batch_settlement_wallet_adapter = build_batch_settlement_wallet_adapter_from_env();
+    let _settlement_wallet_adapter = build_settlement_wallet_adapter_from_env(room_service.clone());
+    let _batch_settlement_wallet_adapter =
+        build_batch_settlement_wallet_adapter_from_env(room_service.clone());
     let settlement_mode = if _batch_settlement_wallet_adapter.is_some() {
         "batch"
     } else if _settlement_wallet_adapter.is_some() {
@@ -457,8 +466,32 @@ async fn main() -> Result<()> {
                 info!("auto settlement loop enabled (direct payout mode)");
                 (Some(auto_tx), Some(handle))
             } else {
-                info!("auto settlement loop not started: wallet adapter disabled");
-                (None, None)
+                let (auto_tx, auto_rx) = oneshot::channel();
+                let room_service_for_loop = room_service.clone();
+                let room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync> =
+                    Arc::new(move || room_service_for_loop.room_ids().map_err(|e| e.to_string()));
+                let settlement_service = Arc::new(settlement::SettlementService::new(
+                    DynLedgerRepo(repo_bundle.ledger_repo.clone()),
+                ));
+                let settlement_repo =
+                    Arc::new(DynSettlementRepo(repo_bundle.settlement_write_repo.clone()));
+                let audit_sink = Arc::new(settlement_audit_sink::AuditSettlementBehaviorSink::new(
+                    repo_bundle.audit_repo.clone(),
+                ));
+                let handle = spawn_auto_settlement_loop_without_wallet(
+                    room_service.clone(),
+                    room_ids_provider,
+                    Arc::new(PokerEngine::new()),
+                    settlement_service,
+                    settlement_repo,
+                    showdown_provider.clone(),
+                    AutoSettlementLoopConfig::default(),
+                    auto_rx,
+                    None,
+                    Some(audit_sink),
+                );
+                info!("auto settlement loop enabled (offchain mode, wallet adapter disabled)");
+                (Some(auto_tx), Some(handle))
             }
         } else {
             info!("auto settlement loop disabled by APP_SERVER__AUTO_SETTLEMENT_ENABLED");

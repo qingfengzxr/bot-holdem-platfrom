@@ -232,7 +232,8 @@ impl PolicyAdapter for CodexCliPolicyAdapter {
             })
             .map_err(|_| PolicyAdapterError::InvalidDecision)?;
 
-        let action_type = parse_action_type(&raw.action_type).ok_or(PolicyAdapterError::InvalidDecision)?;
+        let action_type =
+            parse_action_type(&raw.action_type).ok_or(PolicyAdapterError::InvalidDecision)?;
         let action_name = format!("{:?}", action_type).to_ascii_lowercase();
         if !input.legal_actions.iter().any(|a| a == &action_name) {
             return Err(PolicyAdapterError::InvalidDecision);
@@ -354,7 +355,8 @@ mod tests {
             .rev()
             .find(|line| line.contains("\"action_type\""))
             .expect("decision json line");
-        let parsed: CodexDecisionRaw = serde_json::from_str(decision_line).expect("parse decision json");
+        let parsed: CodexDecisionRaw =
+            serde_json::from_str(decision_line).expect("parse decision json");
         assert_eq!(parsed.action_type, "call");
         assert_eq!(parsed.rationale.as_deref(), Some("raw_stdio_ok"));
         assert!(stderr.contains("RAW_STDERR_BEGIN"));
@@ -379,18 +381,16 @@ mod tests {
         eprintln!("wrapper_path={wrapper_path}");
         eprintln!(
             "env CODEX_WRAPPER_CMD={}",
-            std::env::var("CODEX_WRAPPER_CMD").unwrap_or_else(|_| "<unset, default=codex>".to_string())
+            std::env::var("CODEX_WRAPPER_CMD")
+                .unwrap_or_else(|_| "<unset, default=codex>".to_string())
         );
         eprintln!(
             "env CODEX_WRAPPER_ARGS={}",
             std::env::var("CODEX_WRAPPER_ARGS").unwrap_or_else(|_| "<unset>".to_string())
         );
 
-        let policy = CodexCliPolicyAdapter::new(
-            python_bin,
-            vec![wrapper_path],
-            Duration::from_secs(180),
-        );
+        let policy =
+            CodexCliPolicyAdapter::new(python_bin, vec![wrapper_path], Duration::from_secs(180));
         let input = PolicyDecisionInput {
             room_id: RoomId::new(),
             hand_id: HandId::new(),

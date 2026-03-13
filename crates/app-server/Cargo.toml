@@ -15,7 +15,10 @@ audit-store = { path = "../audit-store" }
 axum.workspace = true
 chain-watcher = { path = "../chain-watcher" }
 chrono.workspace = true
+ethabi.workspace = true
+hex.workspace = true
 jsonrpsee.workspace = true
+k256.workspace = true
 ledger-store = { path = "../ledger-store" }
 observability = { path = "../observability" }
 ops-http = { path = "../ops-http" }
@@ -25,9 +28,11 @@ poker-engine = { path = "../poker-engine" }
 rpc-gateway = { path = "../rpc-gateway" }
 rs_poker.workspace = true
 reqwest.workspace = true
+rlp = "0.5.2"
 seat-crypto = { path = "../seat-crypto" }
 settlement = { path = "../settlement" }
 serde_json.workspace = true
+sha3.workspace = true
 sqlx.workspace = true
 table-service = { path = "../table-service" }
 tokio.workspace = true
@@ -36,4 +41,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 headless-agent-client = { path = "../headless-agent-client" }
-k256.workspace = true

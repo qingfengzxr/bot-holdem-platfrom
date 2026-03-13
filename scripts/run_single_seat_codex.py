@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--room-chain-address",
-        help="table/room receive address; optional, defaults to seat-address",
+        help="table/room receive address; optional, resolves from room.list/room.create",
     )
     p.add_argument("--chain-id", default="31337")
     p.add_argument("--tx-value", default="1")
@@ -155,7 +155,7 @@ def _extract_ok_data(envelope: Any, method: str) -> Any:
     return envelope.get("data")
 
 
-def _select_room_id_from_list_result(data: Any) -> str | None:
+def _select_room_summary_from_list_result(data: Any) -> dict[str, Any] | None:
     if not isinstance(data, list) or not data:
         return None
     active = next(
@@ -168,17 +168,39 @@ def _select_room_id_from_list_result(data: Any) -> str | None:
         ),
         None,
     )
-    if active is not None:
-        return active["room_id"]
+    if isinstance(active, dict):
+        return active
     first = data[0]
     if isinstance(first, dict) and isinstance(first.get("room_id"), str):
-        return first["room_id"]
+        return first
     return None
 
 
-def _resolve_room_id(args: argparse.Namespace) -> str | None:
+def _find_room_summary_by_id(data: Any, room_id: str) -> dict[str, Any] | None:
+    if not isinstance(data, list):
+        return None
+    for room in data:
+        if (
+            isinstance(room, dict)
+            and isinstance(room.get("room_id"), str)
+            and room["room_id"] == room_id
+        ):
+            return room
+    return None
+
+
+def _resolve_room_summary(args: argparse.Namespace) -> dict[str, Any] | None:
     if args.room_id:
-        return args.room_id
+        if args.dry_run:
+            return {"room_id": args.room_id}
+        list_result = _json_rpc_call(
+            args.rpc_endpoint,
+            "room.list",
+            {"include_inactive": True},
+            args.rpc_timeout_sec,
+        )
+        room_list = _extract_ok_data(list_result, "room.list")
+        return _find_room_summary_by_id(room_list, args.room_id) or {"room_id": args.room_id}
     if args.dry_run:
         return None
     list_result = _json_rpc_call(
@@ -188,7 +210,7 @@ def _resolve_room_id(args: argparse.Namespace) -> str | None:
         args.rpc_timeout_sec,
     )
     room_list = _extract_ok_data(list_result, "room.list")
-    picked = _select_room_id_from_list_result(room_list)
+    picked = _select_room_summary_from_list_result(room_list)
     if picked:
         return picked
     if not args.auto_create_room:
@@ -199,7 +221,27 @@ def _resolve_room_id(args: argparse.Namespace) -> str | None:
     created = _extract_ok_data(create_result, "room.create")
     if not isinstance(created, dict) or not isinstance(created.get("room_id"), str):
         raise RuntimeError("room.create succeeded but returned invalid room summary")
-    return created["room_id"]
+    return created
+
+
+def _resolve_room_chain_address(
+    args: argparse.Namespace, room_summary: dict[str, Any] | None
+) -> str:
+    if args.room_chain_address:
+        return args.room_chain_address
+    if isinstance(room_summary, dict):
+        chain_address = room_summary.get("chain_address")
+        if isinstance(chain_address, str) and chain_address.startswith("0x"):
+            return chain_address
+        room_id = room_summary.get("room_id")
+        raise RuntimeError(
+            "room summary missing chain_address for room_id="
+            f"{room_id}; pass --room-chain-address explicitly or upgrade server"
+        )
+    raise RuntimeError(
+        "cannot resolve room chain address without room summary; "
+        "pass --room-id/--room-chain-address or disable --dry-run"
+    )
 
 
 def main() -> int:
@@ -210,8 +252,9 @@ def main() -> int:
             seat_address = "0x0000000000000000000000000000000000000000"
         else:
             seat_address = _resolve_seat_address(args)
-        room_chain_address = args.room_chain_address or seat_address
-        room_id = _resolve_room_id(args)
+        room_summary = _resolve_room_summary(args)
+        room_id = room_summary["room_id"] if isinstance(room_summary, dict) else None
+        room_chain_address = _resolve_room_chain_address(args, room_summary)
     except Exception as exc:
         print(
             "error: "

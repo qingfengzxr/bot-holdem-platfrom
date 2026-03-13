@@ -7,8 +7,8 @@ use ledger_store::{
 };
 use poker_engine::{EngineState, PokerEngine, ShowdownInput};
 use settlement::{
-    BatchSettlementWalletAdapter, BatchSettlementTransferSubmission, RakePolicy, SettlementService,
-    SettlementTransferSubmission, SettlementTransferReceipt, SettlementTxStatus,
+    BatchSettlementTransferSubmission, BatchSettlementWalletAdapter, RakePolicy, SettlementService,
+    SettlementTransferReceipt, SettlementTransferSubmission, SettlementTxStatus,
     SettlementWalletAdapter, mark_failed_receipts_for_manual_review,
 };
 use table_service::RoomHandle;
@@ -367,7 +367,8 @@ where
         .submit_batch_payouts(&plan, batch.seat_addresses, wallet)
         .await
         .map_err(|e| e.to_string())?;
-    persist_batch_submission_record(settlement_repo, settlement_plan_id, state, &submission).await?;
+    persist_batch_submission_record(settlement_repo, settlement_plan_id, state, &submission)
+        .await?;
     emit_batch_submission_audit(audit_sink, state, &submission, trace_id).await;
 
     let receipt = settlement_service
@@ -1228,19 +1229,27 @@ mod tests {
         );
 
         let records = settlement_repo.settlement_records_snapshot();
-        assert!(records
-            .iter()
-            .any(|r| r.settlement_status == "manual_review_required"));
+        assert!(
+            records
+                .iter()
+                .any(|r| r.settlement_status == "manual_review_required")
+        );
 
         let alerts = alert_sink.alerts.lock().expect("lock");
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, "settlement_manual_review_required");
 
         let events = audit_sink.events.lock().expect("lock");
-        assert!(events.iter().any(|e| e.event_kind == "settlement_batch_receipt"));
-        assert!(events
-            .iter()
-            .any(|e| e.event_kind == "settlement_manual_review_required"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_kind == "settlement_batch_receipt")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_kind == "settlement_manual_review_required")
+        );
     }
 
     #[tokio::test]

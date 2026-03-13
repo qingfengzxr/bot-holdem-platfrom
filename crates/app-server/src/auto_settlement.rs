@@ -9,15 +9,19 @@ use ledger_store::{SettlementPersistenceReadRepository, SettlementPersistenceRep
 use poker_domain::{HandId, HandStatus, RoomId, SeatId, TraceId};
 use poker_engine::{PokerEngine, ShowdownInput};
 use rs_poker::core::{Card, FlatHand};
-use settlement::{BatchSettlementWalletAdapter, RakePolicy, SettlementService, SettlementWalletAdapter};
+use settlement::{
+    BatchSettlementWalletAdapter, RakePolicy, SettlementService, SettlementWalletAdapter,
+};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::room_service_port::AppRoomService;
 use crate::settlement_orchestrator::{
     BatchPayoutSettlementInput, DirectPayoutSettlementInput, SettlementAlertSink,
-    SettlementAuditSink, SettlementLifecyclePort, run_showdown_settlement_with_batch_payouts_and_alerts,
+    SettlementAuditSink, SettlementLifecyclePort,
+    run_showdown_settlement_with_batch_payouts_and_alerts,
     run_showdown_settlement_with_direct_payouts_and_alerts,
+    run_showdown_settlement_with_persistence,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,24 +186,45 @@ impl ShowdownInputProvider for AppRoomShowdownInputProvider {
         if let Some(input) = self.inner.get_showdown_input(room_id, hand_id).await? {
             return Ok(Some(input));
         }
-        let Some(repo) = self.showdown_read_repo.as_ref() else {
-            return Ok(None);
-        };
-        let Some(record) = repo
-            .get_settlement_showdown_input(hand_id)
+        if let Some(repo) = self.showdown_read_repo.as_ref() {
+            if let Some(record) = repo
+                .get_settlement_showdown_input(hand_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                if record.room_id == room_id {
+                    let input = showdown_input_from_record(&record)?;
+                    self.inner
+                        .upsert_showdown_input(room_id, hand_id, input.clone())
+                        .await
+                        .map_err(|e| format!("cache showdown input failed: {e}"))?;
+                    return Ok(Some(input));
+                }
+            }
+        }
+
+        let Some(state) = self
+            .room_service
+            .get_engine_state(room_id)
             .await
             .map_err(|e| e.to_string())?
         else {
             return Ok(None);
         };
-        if record.room_id != room_id {
+        if state.snapshot.hand_id != hand_id || state.snapshot.status != HandStatus::Showdown {
             return Ok(None);
         }
-        let input = showdown_input_from_record(&record)?;
+        let Some(input) = showdown_input_from_engine_state(&state) else {
+            return Ok(None);
+        };
         self.inner
             .upsert_showdown_input(room_id, hand_id, input.clone())
             .await
-            .map_err(|e| format!("cache showdown input failed: {e}"))?;
+            .map_err(|e| format!("cache derived showdown input failed: {e}"))?;
+        if let Some(repo) = self.showdown_write_repo.as_ref() {
+            let record = showdown_input_to_record(room_id, hand_id, &input)?;
+            let _ = repo.upsert_settlement_showdown_input(&record).await;
+        }
         Ok(Some(input))
     }
 
@@ -222,8 +247,30 @@ impl ShowdownInputProvider for AppRoomShowdownInputProvider {
     }
 }
 
+fn showdown_input_from_engine_state(state: &poker_engine::EngineState) -> Option<ShowdownInput> {
+    let dealing = state.dealing.as_ref()?;
+    if dealing.board_cards.len() < 5 {
+        return None;
+    }
+    let board = dealing.board_cards.clone();
+    let mut revealed_hole_cards = dealing
+        .hole_cards
+        .iter()
+        .map(|(seat_id, cards)| (*seat_id, *cards))
+        .collect::<Vec<_>>();
+    revealed_hole_cards.sort_by_key(|(seat_id, _)| *seat_id);
+    Some(ShowdownInput {
+        board,
+        revealed_hole_cards,
+    })
+}
+
 fn cards_to_compact_string(cards: &[Card]) -> String {
-    cards.iter().map(ToString::to_string).collect::<Vec<_>>().join("")
+    cards
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn showdown_input_to_record(
@@ -238,10 +285,12 @@ fn showdown_input_to_record(
         revealed_hole_cards: input
             .revealed_hole_cards
             .iter()
-            .map(|(seat_id, cards)| ledger_store::SettlementShowdownSeatCardsRecord {
-                seat_id: *seat_id,
-                cards: cards_to_compact_string(cards),
-            })
+            .map(
+                |(seat_id, cards)| ledger_store::SettlementShowdownSeatCardsRecord {
+                    seat_id: *seat_id,
+                    cards: cards_to_compact_string(cards),
+                },
+            )
             .collect(),
         source: "admin_ops_http".to_string(),
         updated_at: Utc::now(),
@@ -260,8 +309,12 @@ fn showdown_input_from_record(
 
     let mut revealed_hole_cards = Vec::with_capacity(record.revealed_hole_cards.len());
     for seat in &record.revealed_hole_cards {
-        let cards = FlatHand::new_from_str(&seat.cards)
-            .map_err(|e| format!("invalid persisted seat cards for seat {}: {e}", seat.seat_id))?;
+        let cards = FlatHand::new_from_str(&seat.cards).map_err(|e| {
+            format!(
+                "invalid persisted seat cards for seat {}: {e}",
+                seat.seat_id
+            )
+        })?;
         if cards.len() != 2 {
             return Err(format!(
                 "invalid persisted seat cards length for seat {}",
@@ -470,6 +523,68 @@ where
     Ok(AutoSettlementOutcome::Settled)
 }
 
+pub async fn try_auto_settle_showdown_room_without_wallet<L, RP, SP, SR>(
+    room_id: RoomId,
+    engine: &PokerEngine,
+    settlement_service: &SettlementService<L>,
+    settlement_repo: &SR,
+    room_port: &RP,
+    showdown_provider: &SP,
+    rake_policy: RakePolicy,
+    trace_id: TraceId,
+) -> Result<AutoSettlementOutcome, String>
+where
+    L: ledger_store::LedgerRepository,
+    RP: AutoSettlementRoomPort,
+    SR: ledger_store::SettlementPersistenceRepository,
+    SP: ShowdownInputProvider,
+{
+    let Some(state) = room_port.get_engine_state(room_id).await? else {
+        return Ok(AutoSettlementOutcome::NoActiveHand);
+    };
+    if state.snapshot.status != HandStatus::Showdown {
+        return Ok(AutoSettlementOutcome::NotShowdown);
+    }
+
+    let Some(showdown_input) = showdown_provider
+        .get_showdown_input(room_id, state.snapshot.hand_id)
+        .await?
+    else {
+        return Ok(AutoSettlementOutcome::WaitingForShowdownInput);
+    };
+
+    struct RoomLifecycleAdapter<'a, RP> {
+        inner: &'a RP,
+        room_id: RoomId,
+    }
+
+    #[async_trait]
+    impl<RP: AutoSettlementRoomPort> SettlementLifecyclePort for RoomLifecycleAdapter<'_, RP> {
+        async fn complete_settlement(&self, hand_id: HandId) -> Result<(), String> {
+            self.inner.complete_settlement(self.room_id, hand_id).await
+        }
+    }
+
+    let lifecycle = RoomLifecycleAdapter {
+        inner: room_port,
+        room_id,
+    };
+
+    let _ = run_showdown_settlement_with_persistence(
+        engine,
+        settlement_service,
+        settlement_repo,
+        &lifecycle,
+        &state,
+        &showdown_input,
+        rake_policy,
+        trace_id,
+    )
+    .await?;
+
+    Ok(AutoSettlementOutcome::Settled)
+}
+
 pub fn spawn_auto_settlement_loop<L, SP, SR, W>(
     room_service: AppRoomService,
     room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync>,
@@ -579,6 +694,63 @@ where
                             alert_sink.as_deref(),
                             audit_sink.as_deref(),
                         ).await {
+                            warn!(room_id = %room_id.0, error = %err, "auto settlement attempt failed");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+pub fn spawn_auto_settlement_loop_without_wallet<L, SP, SR>(
+    room_service: AppRoomService,
+    room_ids_provider: Arc<dyn Fn() -> Result<Vec<RoomId>, String> + Send + Sync>,
+    engine: Arc<PokerEngine>,
+    settlement_service: Arc<SettlementService<L>>,
+    settlement_repo: Arc<SR>,
+    showdown_provider: Arc<SP>,
+    cfg: AutoSettlementLoopConfig,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    alert_sink: Option<Arc<dyn SettlementAlertSink>>,
+    audit_sink: Option<Arc<dyn SettlementAuditSink>>,
+) -> tokio::task::JoinHandle<()>
+where
+    L: ledger_store::LedgerRepository + Send + Sync + 'static,
+    SP: ShowdownInputProvider + 'static,
+    SR: ledger_store::SettlementPersistenceRepository + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let _ = alert_sink;
+        let _ = audit_sink;
+        let mut ticker = tokio::time::interval(cfg.poll_interval);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("auto settlement loop shutdown");
+                    break;
+                }
+                _ = ticker.tick() => {
+                    let room_ids = match room_ids_provider() {
+                        Ok(ids) => ids,
+                        Err(err) => {
+                            warn!(error = %err, "auto settlement room id provider failed");
+                            continue;
+                        }
+                    };
+                    for room_id in room_ids {
+                        if let Err(err) = try_auto_settle_showdown_room_without_wallet(
+                            room_id,
+                            &engine,
+                            &settlement_service,
+                            &*settlement_repo,
+                            &room_service,
+                            &*showdown_provider,
+                            cfg.rake_policy,
+                            TraceId::new(),
+                        )
+                        .await
+                        {
                             warn!(room_id = %room_id.0, error = %err, "auto settlement attempt failed");
                         }
                     }

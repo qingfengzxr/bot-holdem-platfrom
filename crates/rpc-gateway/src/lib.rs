@@ -7,8 +7,8 @@ use std::{
 };
 
 use agent_auth::{
-    ReplayNonceKey, ReplayNonceStore, SeatKeyBindingClaim, SignedRequestMeta, validate_request_window,
-    verify_seat_key_binding_proof_evm,
+    ReplayNonceKey, ReplayNonceStore, SeatKeyBindingClaim, SignedRequestMeta,
+    validate_request_window, verify_seat_key_binding_proof_evm,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -123,6 +123,7 @@ pub struct RoomCreateRequest {
 pub struct RoomSummary {
     pub room_id: RoomId,
     pub status: String,
+    pub chain_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,10 +419,8 @@ pub struct RpcContext<S, E> {
 
 #[async_trait]
 pub trait RoomServicePort: Send + Sync {
-    async fn create_room(
-        &self,
-        request: RoomCreateRequest,
-    ) -> Result<RoomSummary, RpcGatewayError>;
+    async fn create_room(&self, request: RoomCreateRequest)
+    -> Result<RoomSummary, RpcGatewayError>;
     async fn list_rooms(
         &self,
         request: RoomListRequest,
@@ -2097,13 +2096,16 @@ fn validate_bind_session_keys_proof(
     };
 
     verify_seat_key_binding_proof_evm(&claim, &request.proof_signature)
-    .map_err(|_| RpcGatewayError::InvalidKeyBindingProof)
+        .map_err(|_| RpcGatewayError::InvalidKeyBindingProof)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_auth::{InMemoryReplayNonceStore, build_seat_key_binding_message, evm_address_from_secp256k1_verifying_key, sign_evm_personal_message_secp256k1};
+    use agent_auth::{
+        InMemoryReplayNonceStore, build_seat_key_binding_message,
+        evm_address_from_secp256k1_verifying_key, sign_evm_personal_message_secp256k1,
+    };
     use chrono::Duration;
     use k256::ecdsa::SigningKey;
     use poker_domain::HandId;
@@ -2122,6 +2124,7 @@ mod tests {
             Ok(RoomSummary {
                 room_id: request.room_id.unwrap_or_else(RoomId::new),
                 status: "active".to_string(),
+                chain_address: None,
             })
         }
 
@@ -2209,7 +2212,10 @@ mod tests {
 
     #[async_trait]
     impl RequestSignatureVerifier for AlwaysFailGameActSignatureVerifier {
-        async fn verify_bind_address(&self, _request: &RoomBindAddressRequest) -> Result<(), String> {
+        async fn verify_bind_address(
+            &self,
+            _request: &RoomBindAddressRequest,
+        ) -> Result<(), String> {
             Err("signature verification failed".to_string())
         }
 
@@ -2857,7 +2863,12 @@ mod tests {
         let gw = RpcGateway::new();
         let room_id = RoomId::new();
         let resp = gw
-            .handle_room_create(&DummyRoomService, RoomCreateRequest { room_id: Some(room_id) })
+            .handle_room_create(
+                &DummyRoomService,
+                RoomCreateRequest {
+                    room_id: Some(room_id),
+                },
+            )
             .await;
         assert!(resp.ok, "{resp:?}");
         let data = resp.data.expect("room");

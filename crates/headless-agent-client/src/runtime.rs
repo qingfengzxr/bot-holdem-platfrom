@@ -1,4 +1,6 @@
-use agent_auth::{SeatKeyBindingClaim, SigningMessageInput, build_seat_key_binding_message, build_signing_message};
+use agent_auth::{
+    SeatKeyBindingClaim, SigningMessageInput, build_seat_key_binding_message, build_signing_message,
+};
 use agent_sdk::{AgentSkill, AgentSkillConfig, LocalAgentSkill};
 use platform_core::ResponseEnvelope;
 use poker_domain::{ActionType, Chips, HandSnapshot, LegalAction, RoomId, SeatId};
@@ -200,7 +202,9 @@ fn build_private_state_json(
         return Ok(None);
     }
 
-    let secret = card_encrypt_secret_hex.map(parse_x25519_secret_hex).transpose()?;
+    let secret = card_encrypt_secret_hex
+        .map(parse_x25519_secret_hex)
+        .transpose()?;
     let mut decrypted_hole_cards = Vec::new();
     let mut decrypt_failures = 0_u32;
 
@@ -208,10 +212,11 @@ fn build_private_state_json(
         if event.event_name != "hole_cards_dealt" {
             continue;
         }
-        let payload: HoleCardsDealtCipherPayload = match serde_json::from_value(event.payload.clone()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let payload: HoleCardsDealtCipherPayload =
+            match serde_json::from_value(event.payload.clone()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
         let Some(secret) = secret.as_ref() else {
             continue;
         };
@@ -346,7 +351,10 @@ where
         expires_at: None,
     };
     req.proof_signature = wallet
-        .sign_personal_message(&cfg.seat_address, build_seat_key_binding_message(&claim).as_bytes())
+        .sign_personal_message(
+            &cfg.seat_address,
+            build_seat_key_binding_message(&claim).as_bytes(),
+        )
         .await
         .map_err(|e| RuntimeError::Wallet(e.to_string()))?;
     let params = serde_json::json!({
@@ -382,7 +390,16 @@ where
         .build_room_ready_request()
         .map_err(|e| RuntimeError::AgentSkill(e.to_string()))?;
     let params = serde_json::json!({ "seat_id": req.seat_id });
-    sign_request_meta_with_wallet(cfg, wallet, "room.ready", None, None, &params, &mut req.request_meta).await?;
+    sign_request_meta_with_wallet(
+        cfg,
+        wallet,
+        "room.ready",
+        None,
+        None,
+        &params,
+        &mut req.request_meta,
+    )
+    .await?;
     Ok(req)
 }
 
@@ -398,8 +415,16 @@ where
         .build_room_ready_request()
         .map_err(|e| RuntimeError::AgentSkill(e.to_string()))?;
     let params = serde_json::json!({ "seat_id": req.seat_id });
-    sign_request_meta_with_wallet(cfg, wallet, "room.join", None, None, &params, &mut req.request_meta)
-        .await?;
+    sign_request_meta_with_wallet(
+        cfg,
+        wallet,
+        "room.join",
+        None,
+        None,
+        &params,
+        &mut req.request_meta,
+    )
+    .await?;
     Ok(req)
 }
 
@@ -503,7 +528,9 @@ where
         .await
         .map_err(|e| RuntimeError::Policy(e.to_string()))?
         .ok_or_else(|| RuntimeError::Policy("no policy decision".to_string()))?;
-    execute_turn_decision(cfg, wallet, &turn, &decision).await.map(Some)
+    execute_turn_decision(cfg, wallet, &turn, &decision)
+        .await
+        .map(Some)
 }
 
 pub async fn collect_turn_decision_input(
@@ -590,7 +617,9 @@ fn resolve_action_amount_from_legal_actions(
             let call = legal_actions_raw
                 .iter()
                 .find(|a| a.action_type == ActionType::Call)
-                .ok_or_else(|| RuntimeError::Policy("call not present in legal actions".to_string()))?;
+                .ok_or_else(|| {
+                    RuntimeError::Policy("call not present in legal actions".to_string())
+                })?;
             Ok(call.min_amount.or(decision.amount))
         }
         ActionType::RaiseTo | ActionType::AllIn => Ok(Some(decision.amount.ok_or(
@@ -610,7 +639,8 @@ where
 {
     let skill = connect_skill(&cfg).await?;
 
-    let resolved_amount = resolve_action_amount_from_legal_actions(decision, &turn.legal_actions_raw)?;
+    let resolved_amount =
+        resolve_action_amount_from_legal_actions(decision, &turn.legal_actions_raw)?;
     let amount = resolved_amount.map(|v| v.as_u128().to_string());
     let tx_hash = if let Some(amount_chips) = resolved_amount {
         let tx_receipt = wallet
@@ -712,9 +742,14 @@ mod tests {
             .expect("private state")
             .expect("some");
         assert_eq!(state["events"].as_array().map_or(0, Vec::len), 1);
-        assert_eq!(state["decrypted_hole_cards"].as_array().map_or(0, Vec::len), 0);
         assert_eq!(
-            state["decrypted_hole_cards_pretty"].as_array().map_or(0, Vec::len),
+            state["decrypted_hole_cards"].as_array().map_or(0, Vec::len),
+            0
+        );
+        assert_eq!(
+            state["decrypted_hole_cards_pretty"]
+                .as_array()
+                .map_or(0, Vec::len),
             0
         );
         assert_eq!(state["card_index_encoding"]["suit_bucket_map"][0], "s");

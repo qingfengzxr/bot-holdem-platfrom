@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use hex::FromHex;
-use k256::ecdsa::{RecoveryId, Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey, VerifyingKey as Secp256k1VerifyingKey};
+use k256::ecdsa::{
+    RecoveryId, Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
+    VerifyingKey as Secp256k1VerifyingKey,
+};
 use poker_domain::{AgentId, HandId, RequestId, RoomId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -247,7 +250,8 @@ pub fn verify_evm_personal_signature(
     signature_hex: &str,
 ) -> Result<(), AuthError> {
     let sig_hex = signature_hex.trim().trim_start_matches("0x");
-    let sig_bytes = <Vec<u8>>::from_hex(sig_hex).map_err(|_| AuthError::InvalidEthereumSignature)?;
+    let sig_bytes =
+        <Vec<u8>>::from_hex(sig_hex).map_err(|_| AuthError::InvalidEthereumSignature)?;
     if sig_bytes.len() != 65 {
         return Err(AuthError::InvalidEthereumSignature);
     }
@@ -415,8 +419,8 @@ mod tests {
         let wrong_address = evm_address_from_secp256k1_verifying_key(other_key.verifying_key());
         let message = b"hello-evm-auth";
         let signature = sign_evm_personal_message_secp256k1(&signing_key, message).expect("sign");
-        let err =
-            verify_evm_personal_signature(&wrong_address, message, &signature).expect_err("mismatch");
+        let err = verify_evm_personal_signature(&wrong_address, message, &signature)
+            .expect_err("mismatch");
         assert!(matches!(err, AuthError::EthereumAddressMismatch));
     }
 
@@ -472,8 +476,7 @@ mod tests {
             seat_address,
             ..claim_for_sig
         };
-        let err =
-            verify_seat_key_binding_proof_evm(&mismatched_claim, &sig).expect_err("mismatch");
+        let err = verify_seat_key_binding_proof_evm(&mismatched_claim, &sig).expect_err("mismatch");
         assert!(matches!(err, AuthError::EthereumAddressMismatch));
     }
 }

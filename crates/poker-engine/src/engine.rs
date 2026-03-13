@@ -137,6 +137,11 @@ impl PokerEngine {
 
         let mut iter = deck.into_iter();
         let new_hand_id = poker_domain::HandId::new();
+        // Keep room-level hand numbering monotonic so persistence keys remain stable.
+        // The initial state starts as Created/hand_no=1; every subsequent deal must increment.
+        if !matches!(state.snapshot.status, HandStatus::Created) {
+            state.snapshot.hand_no = state.snapshot.hand_no.saturating_add(1);
+        }
         let mut hole_cards: HashMap<SeatId, [Card; 2]> = HashMap::new();
         for _round in 0..2 {
             for seat in &seats {
@@ -187,12 +192,11 @@ impl PokerEngine {
         state.hand.acting_seat_id = Some(first_to_act);
         state.betting_round.acting_seat_id = Some(first_to_act);
         state.betting_round.current_bet = DEFAULT_BIG_BLIND;
-        state.betting_round.min_raise_to =
-            Some(
-                DEFAULT_BIG_BLIND
-                    .checked_add(DEFAULT_BIG_BLIND)
-                    .unwrap_or(DEFAULT_BIG_BLIND),
-            );
+        state.betting_round.min_raise_to = Some(
+            DEFAULT_BIG_BLIND
+                .checked_add(DEFAULT_BIG_BLIND)
+                .unwrap_or(DEFAULT_BIG_BLIND),
+        );
         state.betting_round.player_bets.clear();
         state.betting_round.acted_seats.clear();
         state.pot.main_pot = Chips::ZERO;
@@ -289,8 +293,7 @@ impl PokerEngine {
                     .insert(action.seat_id, target);
                 if is_raise {
                     state.betting_round.current_bet = target;
-                    state.betting_round.min_raise_to =
-                        Some(next_min_raise_to(current_bet, target));
+                    state.betting_round.min_raise_to = Some(next_min_raise_to(current_bet, target));
                 }
                 state.pot.main_pot = state.pot.main_pot.checked_add(delta)?;
                 add_contribution(state, action.seat_id, delta)?;
@@ -525,12 +528,8 @@ impl PokerEngine {
             state.snapshot.status = HandStatus::Showdown;
             state.snapshot.street = Street::Showdown;
             if let Some(dealing) = state.dealing.as_ref() {
-                state.snapshot.board_cards = dealing
-                    .board_cards
-                    .iter()
-                    .copied()
-                    .map(u8::from)
-                    .collect();
+                state.snapshot.board_cards =
+                    dealing.board_cards.iter().copied().map(u8::from).collect();
             }
             state.hand.street = Street::Showdown;
             state.snapshot.acting_seat_id = None;
@@ -626,15 +625,11 @@ fn state_dealer_index(hand_no: u64, seat_count: usize) -> usize {
 }
 
 fn next_min_raise_to(current_bet: Chips, target_bet: Chips) -> Chips {
-    let raise_size = target_bet
-        .checked_sub(current_bet)
-        .unwrap_or(Chips::ZERO);
+    let raise_size = target_bet.checked_sub(current_bet).unwrap_or(Chips::ZERO);
     if raise_size == Chips::ZERO {
         return target_bet;
     }
-    target_bet
-        .checked_add(raise_size)
-        .unwrap_or(target_bet)
+    target_bet.checked_add(raise_size).unwrap_or(target_bet)
 }
 
 fn ordered_deck() -> Vec<Card> {
@@ -735,5 +730,30 @@ fn build_pot_layers(
 impl Default for PokerEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hand_number_increments_when_dealing_next_hand() {
+        let engine = PokerEngine::new();
+        let room_id = poker_domain::RoomId::new();
+        let mut state = EngineState::new(room_id, 1);
+        state.seat_player(0);
+        state.seat_player(1);
+
+        engine
+            .deal_new_hand_internal_with_deck(&mut state, ordered_deck())
+            .expect("first hand deal");
+        assert_eq!(state.snapshot.hand_no, 1, "first hand number must stay at 1");
+
+        state.snapshot.status = HandStatus::Settled;
+        engine
+            .deal_new_hand_internal_with_deck(&mut state, ordered_deck())
+            .expect("second hand deal");
+        assert_eq!(state.snapshot.hand_no, 2, "next hand number must increment");
     }
 }

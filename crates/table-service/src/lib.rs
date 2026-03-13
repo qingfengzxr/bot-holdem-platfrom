@@ -294,6 +294,10 @@ pub struct SeatPrivateEvent {
 }
 
 pub trait RoomEventSink: Send + Sync {
+    fn upsert_hand_snapshot(&self, _snapshot: &HandSnapshot) -> Result<(), String> {
+        Ok(())
+    }
+
     fn append_hand_events(&self, _events: &[HandEvent]) -> Result<(), String> {
         Ok(())
     }
@@ -558,6 +562,14 @@ pub fn spawn_room_actor_with_sink_and_config(
                                 );
                                 continue;
                             }
+                            if let Err(err) = event_sink.upsert_hand_snapshot(&state.snapshot) {
+                                warn!(
+                                    ?room_id,
+                                    hand_id = %state.snapshot.hand_id.0,
+                                    error = %err,
+                                    "upsert hand snapshot on hand start failed"
+                                );
+                            }
                             let new_private_events = build_hole_cards_private_events(
                                 &state,
                                 &card_pubkeys,
@@ -632,6 +644,15 @@ pub fn spawn_room_actor_with_sink_and_config(
                         .apply_action(&mut state, action)
                         .map_err(|err| err.to_string());
                     if let Ok(engine_result) = result.as_ref() {
+                        if let Err(err) = event_sink.upsert_hand_snapshot(&state.snapshot) {
+                            warn!(
+                                ?room_id,
+                                hand_id = %state.snapshot.hand_id.0,
+                                action_seq = state.snapshot.next_action_seq,
+                                error = %err,
+                                "upsert hand snapshot after action failed"
+                            );
+                        }
                         emit_post_action_hand_events(
                             &*event_sink,
                             room_id,
@@ -651,15 +672,14 @@ pub fn spawn_room_actor_with_sink_and_config(
                     reply,
                 } => {
                     let queued_action = action.clone();
-                    let _ = pending_chain_actions
-                        .insert(
-                            tx_hash.clone(),
-                            PendingChainAction {
-                                action,
-                                queued_at: Instant::now(),
-                                last_warn_at: None,
-                            },
-                        );
+                    let _ = pending_chain_actions.insert(
+                        tx_hash.clone(),
+                        PendingChainAction {
+                            action,
+                            queued_at: Instant::now(),
+                            last_warn_at: None,
+                        },
+                    );
                     info!(
                         ?room_id,
                         hand_id = %queued_action.hand_id.0,
@@ -702,6 +722,15 @@ pub fn spawn_room_actor_with_sink_and_config(
                             .apply_action(&mut state, pending.action)
                             .map_err(|err| err.to_string());
                         if let Ok(engine_result) = result.as_ref() {
+                            if let Err(err) = event_sink.upsert_hand_snapshot(&state.snapshot) {
+                                warn!(
+                                    ?room_id,
+                                    hand_id = %state.snapshot.hand_id.0,
+                                    action_seq = state.snapshot.next_action_seq,
+                                    error = %err,
+                                    "upsert hand snapshot after verified pending action failed"
+                                );
+                            }
                             info!(
                                 ?room_id,
                                 hand_id = %submitted_action.hand_id.0,
@@ -846,6 +875,15 @@ pub fn spawn_room_actor_with_sink_and_config(
                         .apply_action(&mut state, auto_fold)
                         .map_err(|err| err.to_string());
                     if let Ok(engine_result) = result.as_ref() {
+                        if let Err(err) = event_sink.upsert_hand_snapshot(&state.snapshot) {
+                            warn!(
+                                ?room_id,
+                                hand_id = %state.snapshot.hand_id.0,
+                                action_seq = state.snapshot.next_action_seq,
+                                error = %err,
+                                "upsert hand snapshot after timeout auto-fold failed"
+                            );
+                        }
                         emit_post_action_hand_events(
                             &*event_sink,
                             room_id,
@@ -1055,6 +1093,15 @@ pub fn spawn_room_actor_with_sink_and_config(
                             .apply_action(&mut state, auto_fold)
                             .map_err(|err| err.to_string());
                         if let Ok(engine_result) = result.as_ref() {
+                            if let Err(err) = event_sink.upsert_hand_snapshot(&state.snapshot) {
+                                warn!(
+                                    ?room_id,
+                                    hand_id = %state.snapshot.hand_id.0,
+                                    action_seq = state.snapshot.next_action_seq,
+                                    error = %err,
+                                    "upsert hand snapshot after scheduler auto-fold failed"
+                                );
+                            }
                             emit_post_action_hand_events(
                                 &*event_sink,
                                 room_id,
@@ -1369,7 +1416,11 @@ mod tests {
             assert_eq!(ev.event_name, "hole_cards_dealt");
             let payload: HoleCardsDealtCipherPayload =
                 serde_json::from_value(ev.payload.clone()).expect("parse payload");
-            let secret = if ev.seat_id == 0 { key0.secret } else { key1.secret };
+            let secret = if ev.seat_id == 0 {
+                key0.secret
+            } else {
+                key1.secret
+            };
             let plaintext = decrypt_with_recipient_x25519(&secret, &payload.aad, &payload.envelope)
                 .expect("decrypt");
             let value: serde_json::Value = serde_json::from_slice(&plaintext).expect("json");

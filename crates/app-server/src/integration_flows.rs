@@ -6,9 +6,9 @@ mod tests {
     use std::time::Duration;
 
     use agent_auth::{
-        SeatKeyBindingClaim, SignedRequestMeta, SigningMessageInput, build_seat_key_binding_message,
-        build_signing_message, evm_address_from_secp256k1_verifying_key,
-        sign_evm_personal_message_secp256k1,
+        SeatKeyBindingClaim, SignedRequestMeta, SigningMessageInput,
+        build_seat_key_binding_message, build_signing_message,
+        evm_address_from_secp256k1_verifying_key, sign_evm_personal_message_secp256k1,
     };
     use app_server_dummy_private_support::*;
     use chain_watcher::{
@@ -38,9 +38,7 @@ mod tests {
     // Local support types re-exported through a private submodule to keep imports explicit.
     mod app_server_dummy_private_support {
         pub use audit_store::InMemoryAuditRepository;
-        pub use chain_watcher::{
-            TxVerificationCallback, VerificationStatus,
-        };
+        pub use chain_watcher::{TxVerificationCallback, VerificationStatus};
         pub use ledger_store::InMemoryChainTxRepository;
         pub use table_service::NoopRoomEventSink;
     }
@@ -182,7 +180,10 @@ mod tests {
                 .expect("sigpk")
                 .to_string(),
             key_algo: params["key_algo"].as_str().expect("algo").to_string(),
-            proof_signature: params["proof_signature"].as_str().expect("proof").to_string(),
+            proof_signature: params["proof_signature"]
+                .as_str()
+                .expect("proof")
+                .to_string(),
             request_meta,
         }
     }
@@ -474,7 +475,13 @@ mod tests {
         let mut req = signed_bind_session_keys_request(room_id, 0, &evm_key);
         req.request_meta.signature = "0xdeadbeef".to_string();
         let resp = gateway
-            .handle_bind_session_keys_with_audit(&room_service, req, None, None, Some(&sig_verifier))
+            .handle_bind_session_keys_with_audit(
+                &room_service,
+                req,
+                None,
+                None,
+                Some(&sig_verifier),
+            )
             .await;
         assert!(!resp.ok, "{resp:?}");
         let err = resp.error.expect("error");
@@ -612,7 +619,11 @@ mod tests {
             .expect("bind keys");
         room_actor.ready(0).await.expect("ready");
 
-        let before = room_actor.get_state().await.expect("state").expect("snapshot");
+        let before = room_actor
+            .get_state()
+            .await
+            .expect("state")
+            .expect("snapshot");
         let mut req = signed_game_act_request(
             room_id,
             before.hand_id,
@@ -630,7 +641,11 @@ mod tests {
         let err = resp.error.expect("error");
         assert_eq!(err.code, platform_core::ErrorCode::Forbidden);
 
-        let after = room_actor.get_state().await.expect("state").expect("snapshot");
+        let after = room_actor
+            .get_state()
+            .await
+            .expect("state")
+            .expect("snapshot");
         assert_eq!(after.next_action_seq, before.next_action_seq);
     }
 
@@ -740,9 +755,7 @@ mod tests {
                 Some(sig_verifier),
             )
             .expect("rpc module");
-        let server = ServerBuilder::default()
-            .build("127.0.0.1:0")
-            .await;
+        let server = ServerBuilder::default().build("127.0.0.1:0").await;
         let server = match server {
             Ok(server) => server,
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -812,17 +825,19 @@ mod tests {
 
         for _ in 0..16 {
             let state_before: platform_core::ResponseEnvelope<Option<poker_domain::HandSnapshot>> =
-                serde_json::from_value(http_rpc_call(
-                    &rpc_endpoint,
-                    "game.get_state",
-                    serde_json::to_value(GameGetStateRequest {
-                        room_id,
-                        hand_id: None,
-                        seat_id: Some(0),
-                    })
-                    .expect("state req json"),
+                serde_json::from_value(
+                    http_rpc_call(
+                        &rpc_endpoint,
+                        "game.get_state",
+                        serde_json::to_value(GameGetStateRequest {
+                            room_id,
+                            hand_id: None,
+                            seat_id: Some(0),
+                        })
+                        .expect("state req json"),
+                    )
+                    .await,
                 )
-                .await)
                 .expect("decode state_before");
             assert!(state_before.ok, "{state_before:?}");
             let before = state_before.data.flatten().expect("snapshot before");
@@ -834,19 +849,18 @@ mod tests {
             };
             let (acted_seat, outcome) = run_first_available_action(
                 &[
-                    SeatTurnRunnerInput {
-                        cfg: &seat0_cfg,
-                    },
-                    SeatTurnRunnerInput {
-                        cfg: &seat1_cfg,
-                    },
+                    SeatTurnRunnerInput { cfg: &seat0_cfg },
+                    SeatTurnRunnerInput { cfg: &seat1_cfg },
                 ],
                 &wallet,
             )
             .await
             .expect("run first available action")
             .expect("some seat should be able to act");
-            assert_eq!(acted_seat, acting, "runtime should act for current acting seat");
+            assert_eq!(
+                acted_seat, acting,
+                "runtime should act for current acting seat"
+            );
             let seat_addr = match acted_seat {
                 0 => seat0_addr.clone(),
                 1 => seat1_addr.clone(),
@@ -887,17 +901,19 @@ mod tests {
         assert!(action_count >= 1, "expected at least one action");
 
         let state_after: platform_core::ResponseEnvelope<Option<poker_domain::HandSnapshot>> =
-            serde_json::from_value(http_rpc_call(
-                &rpc_endpoint,
-                "game.get_state",
-                serde_json::to_value(GameGetStateRequest {
-                    room_id,
-                    hand_id: last_hand_id,
-                    seat_id: Some(0),
-                })
-                .expect("state req json"),
+            serde_json::from_value(
+                http_rpc_call(
+                    &rpc_endpoint,
+                    "game.get_state",
+                    serde_json::to_value(GameGetStateRequest {
+                        room_id,
+                        hand_id: last_hand_id,
+                        seat_id: Some(0),
+                    })
+                    .expect("state req json"),
+                )
+                .await,
             )
-            .await)
             .expect("decode state_after");
         assert!(state_after.ok, "{state_after:?}");
         let after = state_after.data.flatten().expect("snapshot after");

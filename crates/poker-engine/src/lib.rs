@@ -4,8 +4,7 @@ mod engine;
 mod state;
 
 pub use engine::{
-    DEFAULT_BIG_BLIND, DEFAULT_SMALL_BLIND, EngineError, PokerEngine, ShowdownInput,
-    ShowdownResult,
+    DEFAULT_BIG_BLIND, DEFAULT_SMALL_BLIND, EngineError, PokerEngine, ShowdownInput, ShowdownResult,
 };
 pub use state::{
     BettingRoundState, DealingState, EngineState, HandState, PotLayer, PotState, SidePot,
@@ -63,8 +62,7 @@ mod tests {
                 Some(DEFAULT_BIG_BLIND)
             );
             assert_eq!(
-                state.betting_round.current_bet,
-                DEFAULT_BIG_BLIND,
+                state.betting_round.current_bet, DEFAULT_BIG_BLIND,
                 "hand_no={hand_no} seat_count={seat_count}"
             );
             assert_eq!(

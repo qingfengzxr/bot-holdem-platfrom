@@ -6,17 +6,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use headless_agent_client::policy_adapter::{
+    CodexCliPolicyAdapter, DecisionContextEntry, DecisionContextManager, PolicyAdapter,
+    RulePolicyAdapter,
+};
 use headless_agent_client::runtime::{
     RuntimeError, SingleActionRunnerConfig, collect_turn_decision_input, execute_turn_decision,
     prepare_seat,
 };
 use headless_agent_client::wallet_adapter::JsonRpcEvmWalletAdapter;
-use platform_core::ResponseEnvelope;
-use headless_agent_client::policy_adapter::{
-    CodexCliPolicyAdapter, DecisionContextEntry, DecisionContextManager, PolicyAdapter,
-    RulePolicyAdapter,
-};
 use observability::init_tracing;
+use platform_core::ResponseEnvelope;
 use poker_domain::{Chips, HandId, HandStatus, RoomId};
 use rpc_gateway::{
     EventEnvelope, EventTopic, GameGetPrivatePayloadsRequest, GameGetStateRequest,
@@ -255,6 +255,18 @@ fn notation_with_suit_symbols(card: &str) -> String {
     format!("{rank}{suit_symbol}")
 }
 
+fn hole_cards_with_suit_symbols(pretty_cards: &[Vec<String>]) -> Vec<Vec<String>> {
+    pretty_cards
+        .iter()
+        .map(|cards| {
+            cards
+                .iter()
+                .map(|card| notation_with_suit_symbols(card))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+}
+
 fn format_wei_as_eth(wei: u128) -> String {
     const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
     let whole = wei / WEI_PER_ETH;
@@ -427,7 +439,8 @@ async fn sync_hole_cards_for_hand(
         if event.event_name != "hole_cards_dealt" {
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<HoleCardsDealtCipherPayload>(event.payload) else {
+        let Ok(payload) = serde_json::from_value::<HoleCardsDealtCipherPayload>(event.payload)
+        else {
             continue;
         };
         let Ok(plaintext) = decrypt_with_recipient_x25519(&secret, &payload.aad, &payload.envelope)
@@ -449,11 +462,15 @@ async fn sync_hole_cards_for_hand(
         return Ok(());
     };
     let pretty_cards = pretty_hole_cards(&private_state);
+    let symbol_cards = pretty_cards
+        .as_ref()
+        .map(|cards| hole_cards_with_suit_symbols(cards));
     info!(
         hand_id = %hand_id.0,
         seat_id = cfg.seat_id,
         hole_cards_raw = %cards_raw,
         hole_cards_pretty = ?pretty_cards,
+        hole_cards_symbols = ?symbol_cards,
         "hole cards synced on hand start"
     );
     synced_hands.insert(hand_id.0);
@@ -519,11 +536,15 @@ where
         && let Some(cards) = private_state.get("decrypted_hole_cards")
     {
         let pretty_cards = pretty_hole_cards(private_state);
+        let symbol_cards = pretty_cards
+            .as_ref()
+            .map(|cards| hole_cards_with_suit_symbols(cards));
         info!(
             hand_id = %turn.hand_id.0,
             action_seq = turn.action_seq,
             hole_cards_raw = %cards,
             hole_cards_pretty = ?pretty_cards,
+            hole_cards_symbols = ?symbol_cards,
             "received hole cards"
         );
     }
@@ -541,10 +562,18 @@ where
     }
 
     let decision = match policy_mode {
-        PolicyMode::Rule => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),
+        PolicyMode::Rule => rule_policy
+            .decide_action(&turn.policy_input)
+            .await
+            .ok()
+            .flatten(),
         PolicyMode::CodexCli => match codex_policy.decide_action(&turn.policy_input).await {
             Ok(Some(v)) => Some(v),
-            _ => rule_policy.decide_action(&turn.policy_input).await.ok().flatten(),
+            _ => rule_policy
+                .decide_action(&turn.policy_input)
+                .await
+                .ok()
+                .flatten(),
         },
     };
     let Some(decision) = decision else {
@@ -689,7 +718,8 @@ async fn subscribe_events(
         {
             return Ok(subscription_id.to_string());
         }
-        let compact = serde_json::to_string(&value).unwrap_or_else(|_| "<invalid-json>".to_string());
+        let compact =
+            serde_json::to_string(&value).unwrap_or_else(|_| "<invalid-json>".to_string());
         bail!("websocket subscribe response missing subscription id: {compact}");
     }
 
@@ -700,7 +730,8 @@ async fn subscribe_events(
 async fn main() -> Result<()> {
     init_tracing("single-seat-client");
 
-    let wallet_rpc = env_optional("WALLET_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+    let wallet_rpc =
+        env_optional("WALLET_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
     let wallet = JsonRpcEvmWalletAdapter::new(wallet_rpc.clone());
     let chain_id = env_parse_u64("CHAIN_ID", 31_337)?;
     let policy_timeout_ms = env_parse_u64("POLICY_TIMEOUT_MS", 180_000)?;
@@ -727,7 +758,9 @@ async fn main() -> Result<()> {
         "single seat client starting"
     );
 
-    prepare_seat(cfg.clone(), &wallet).await.context("prepare_seat failed")?;
+    prepare_seat(cfg.clone(), &wallet)
+        .await
+        .context("prepare_seat failed")?;
     info!("seat prepared, entering action loop");
 
     let mut decision_ctx = DecisionContextManager::with_max_entries(context_max_entries);
@@ -756,22 +789,15 @@ async fn main() -> Result<()> {
             }
         };
 
-        let hand_subscription_id = match subscribe_events(
-            &mut ws_stream,
-            &cfg,
-            EventTopic::HandEvents,
-            None,
-            1,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(error = %err, "subscribe events failed");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
+        let hand_subscription_id =
+            match subscribe_events(&mut ws_stream, &cfg, EventTopic::HandEvents, None, 1).await {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!(error = %err, "subscribe events failed");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
         let seat_subscription_id = match subscribe_events(
             &mut ws_stream,
             &cfg,
@@ -796,14 +822,13 @@ async fn main() -> Result<()> {
         if let Err(err) = sync_hole_cards_for_current_hand(&cfg, &mut synced_hands).await {
             warn!(error = %err, "sync hole cards for current hand failed");
         }
-        if let Err(err) =
-            poll_room_hand_state(
-                &cfg,
-                &wallet,
-                &mut last_observed_hand_state,
-                &mut last_attempted_turn,
-            )
-                .await
+        if let Err(err) = poll_room_hand_state(
+            &cfg,
+            &wallet,
+            &mut last_observed_hand_state,
+            &mut last_attempted_turn,
+        )
+        .await
         {
             warn!(error = %err, "initial room state poll failed");
         }

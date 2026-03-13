@@ -2,23 +2,127 @@ use std::sync::Arc;
 
 use audit_store::{AuditRepository, BehaviorEventRecord, OutboxEventRecord};
 use chrono::Utc;
+use poker_domain::{HandSnapshot, HandStatus, Street};
 use serde_json::to_value;
+use sqlx::PgPool;
 use table_service::{RoomBehaviorEvent, RoomEventSink, SeatPrivateEvent};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AuditRoomEventSink<R: AuditRepository + ?Sized + 'static> {
     repo: Arc<R>,
+    db_pool: Option<PgPool>,
 }
 
 impl<R: AuditRepository + ?Sized + 'static> AuditRoomEventSink<R> {
     #[must_use]
     pub fn new(repo: Arc<R>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            db_pool: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_db_pool(mut self, db_pool: Option<PgPool>) -> Self {
+        self.db_pool = db_pool;
+        self
+    }
+
+    async fn upsert_hand_snapshot_row(
+        pool: &PgPool,
+        snapshot: &HandSnapshot,
+    ) -> Result<(), String> {
+        let hand_status = match snapshot.status {
+            HandStatus::Created => "Created",
+            HandStatus::Running => "Running",
+            HandStatus::Showdown => "Showdown",
+            HandStatus::Settling => "Settling",
+            HandStatus::Settled => "Settled",
+            HandStatus::Aborted => "Aborted",
+        };
+        let street = match snapshot.street {
+            Street::Preflop => "Preflop",
+            Street::Flop => "Flop",
+            Street::Turn => "Turn",
+            Street::River => "River",
+            Street::Showdown => "Showdown",
+        };
+        let action_seq_next = i32::try_from(snapshot.next_action_seq).unwrap_or(i32::MAX);
+        let hand_no = i64::try_from(snapshot.hand_no).unwrap_or(i64::MAX);
+        let acting_seat_id = snapshot.acting_seat_id.map(i16::from);
+        let pot_total = snapshot.pot_total.as_u128().to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO hands (
+                hand_id, room_id, hand_no, button_seat_id, hand_status, street, acting_seat_id,
+                action_seq_next, pot_total, rake_accrued, incoming_total, settlement_pending_total,
+                ended_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, CAST($9 AS NUMERIC), CAST($10 AS NUMERIC), CAST($11 AS NUMERIC), CAST($12 AS NUMERIC),
+                CASE WHEN $13 THEN NOW() ELSE NULL END
+            )
+            ON CONFLICT (hand_id) DO UPDATE SET
+                room_id = EXCLUDED.room_id,
+                hand_no = EXCLUDED.hand_no,
+                hand_status = EXCLUDED.hand_status,
+                street = EXCLUDED.street,
+                acting_seat_id = EXCLUDED.acting_seat_id,
+                action_seq_next = EXCLUDED.action_seq_next,
+                pot_total = EXCLUDED.pot_total,
+                ended_at = CASE
+                    WHEN EXCLUDED.hand_status IN ('Settled', 'Aborted') THEN COALESCE(hands.ended_at, NOW())
+                    ELSE NULL
+                END
+            "#,
+        )
+        .bind(snapshot.hand_id.0)
+        .bind(snapshot.room_id.0)
+        .bind(hand_no)
+        .bind(0_i16)
+        .bind(hand_status)
+        .bind(street)
+        .bind(acting_seat_id)
+        .bind(action_seq_next)
+        .bind(pot_total)
+        .bind("0")
+        .bind("0")
+        .bind("0")
+        .bind(matches!(snapshot.status, HandStatus::Settled | HandStatus::Aborted))
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        tracing::debug!(
+            room_id = %snapshot.room_id.0,
+            hand_id = %snapshot.hand_id.0,
+            action_seq = snapshot.next_action_seq,
+            status = ?snapshot.status,
+            street = ?snapshot.street,
+            "hand snapshot persisted"
+        );
+        Ok(())
     }
 }
 
 impl<R: AuditRepository + ?Sized + 'static> RoomEventSink for AuditRoomEventSink<R> {
+    fn upsert_hand_snapshot(&self, snapshot: &HandSnapshot) -> Result<(), String> {
+        let Some(pool) = self.db_pool.clone() else {
+            tracing::debug!(
+                room_id = %snapshot.room_id.0,
+                hand_id = %snapshot.hand_id.0,
+                "skip hand snapshot persistence: db pool disabled"
+            );
+            return Ok(());
+        };
+        let snapshot = snapshot.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(Self::upsert_hand_snapshot_row(&pool, &snapshot))
+        })
+    }
+
     fn append_hand_events(&self, events: &[poker_domain::HandEvent]) -> Result<(), String> {
         let repo = self.repo.clone();
         let events_vec = events.to_vec();

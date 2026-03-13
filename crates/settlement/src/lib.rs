@@ -148,10 +148,7 @@ impl RakePolicy {
         }
         // Chain unit is integer chips, so rake always rounds down.
         Ok(Chips(
-            pot_total
-                .as_u128()
-                .saturating_mul(self.rake_bps as u128)
-                / 10_000,
+            pot_total.as_u128().saturating_mul(self.rake_bps as u128) / 10_000,
         ))
     }
 }
@@ -541,9 +538,10 @@ where
         let encrypted_len = record.encrypted_private_key.len();
         let key_version = record.key_version;
         let address = record.address.clone();
-        let private_key_bytes = load_and_decrypt_active_room_signing_key(repo, room_id, resolve_kek)
-            .await?
-            .ok_or_else(|| SettlementError::KeyDecrypt("active key disappeared".to_string()))?;
+        let private_key_bytes =
+            load_and_decrypt_active_room_signing_key(repo, room_id, resolve_kek)
+                .await?
+                .ok_or_else(|| SettlementError::KeyDecrypt("active key disappeared".to_string()))?;
         info!(
             room_id = %room_id.0,
             address = %address,

@@ -97,7 +97,11 @@ impl RequestSignatureVerifier for AppRpcRequestSignatureVerifier {
             meta: &request.request_meta,
         })
         .map_err(|e| e.to_string())?;
-        verify_evm_personal_signature(&seat_address, message.as_bytes(), &request.request_meta.signature)
+        verify_evm_personal_signature(
+            &seat_address,
+            message.as_bytes(),
+            &request.request_meta.signature,
+        )
         .map_err(|e| e.to_string())
     }
 
@@ -127,7 +131,11 @@ impl RequestSignatureVerifier for AppRpcRequestSignatureVerifier {
         })
         .map_err(|e| e.to_string())?;
 
-        verify_evm_personal_signature(&seat_address, message.as_bytes(), &request.request_meta.signature)
+        verify_evm_personal_signature(
+            &seat_address,
+            message.as_bytes(),
+            &request.request_meta.signature,
+        )
         .map_err(|e| e.to_string())
     }
 }

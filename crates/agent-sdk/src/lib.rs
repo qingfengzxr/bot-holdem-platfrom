@@ -198,7 +198,9 @@ impl LocalAgentSkill {
         })
     }
 
-    pub fn build_get_legal_actions_request(&self) -> Result<GameGetLegalActionsRequest, AgentSkillError> {
+    pub fn build_get_legal_actions_request(
+        &self,
+    ) -> Result<GameGetLegalActionsRequest, AgentSkillError> {
         let seat_ctx = self
             .seat_ctx
             .as_ref()
@@ -426,13 +428,14 @@ mod tests {
     #[tokio::test]
     async fn local_skill_builds_ready_and_bind_session_keys_requests() {
         let mut skill = LocalAgentSkill::default();
-        skill.connect(AgentSkillConfig {
-            endpoint_http: "http://127.0.0.1:9000".to_string(),
-            endpoint_ws: None,
-            session_id: None,
-        })
-        .await
-        .expect("connect");
+        skill
+            .connect(AgentSkillConfig {
+                endpoint_http: "http://127.0.0.1:9000".to_string(),
+                endpoint_ws: None,
+                session_id: None,
+            })
+            .await
+            .expect("connect");
         let room_id = RoomId::new();
         skill.join_room(room_id, 1).await.expect("join");
         let _bind_addr = skill
@@ -457,13 +460,14 @@ mod tests {
     #[tokio::test]
     async fn local_skill_builds_game_act_request() {
         let mut skill = LocalAgentSkill::default();
-        skill.connect(AgentSkillConfig {
-            endpoint_http: "http://127.0.0.1:9000".to_string(),
-            endpoint_ws: None,
-            session_id: None,
-        })
-        .await
-        .expect("connect");
+        skill
+            .connect(AgentSkillConfig {
+                endpoint_http: "http://127.0.0.1:9000".to_string(),
+                endpoint_ws: None,
+                session_id: None,
+            })
+            .await
+            .expect("connect");
         let room_id = RoomId::new();
         skill.join_room(room_id, 0).await.expect("join");
         let _ = skill
